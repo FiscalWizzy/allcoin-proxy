@@ -1,1 +1,1 @@
-web: gunicorn -b 0.0.0.0:8080 proxy_server:app
+web: python proxy_server.py
