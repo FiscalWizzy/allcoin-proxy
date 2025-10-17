@@ -282,22 +282,21 @@ def _frankfurter_delta_loop():
 # Background: Insights
 # -----------------------
 def _insights_loop():
-    """Fetch BTC, ETH, EUR/USD, and DAX; auto-backoff on 429 errors."""
+    """Fetch BTC, ETH, EUR/USD, and DAX; auto-backoff on errors."""
     global insights_snapshot
     cooldown = 0
     while True:
         try:
             if cooldown > 0:
-                _log("INFO", f"🕒 Cooling down {cooldown}s to respect API limits")
+                _log("INFO", f"🕒 Cooling down {cooldown}s to respect limits")
                 time.sleep(cooldown)
                 cooldown = 0
 
-            # --- Crypto prices from CoinGecko ---
-            cg = http_get_json(
-                f"{COINGECKO_API}/simple/price",
-                timeout=8,
-                params={"ids": "bitcoin,ethereum", "vs_currencies": "usd"},
-            )
+            # --- BTC & ETH from Binance ---
+            btc_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=8)
+            eth_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=8)
+            btc_usd = float(btc_resp.json()["price"])
+            eth_usd = float(eth_resp.json()["price"])
 
             # --- EUR/USD from ExchangeRate API ---
             fx = http_get_json(
@@ -306,13 +305,7 @@ def _insights_loop():
             )
 
             # --- DAX from Yahoo Finance ---
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/127.0.0.1 Safari/537.36"
-                )
-            }
+            headers = {"User-Agent": "Mozilla/5.0"}
             dax_resp = requests.get(
                 "https://query1.finance.yahoo.com/v8/finance/chart/%5EGDAXI",
                 params={"interval": "1h"},
@@ -321,16 +314,13 @@ def _insights_loop():
             )
             dax_json = dax_resp.json()
             dax_val = (
-                dax_json.get("chart", {})
-                .get("result", [{}])[0]
-                .get("meta", {})
-                .get("regularMarketPrice")
+                dax_json.get("chart", {}).get("result", [{}])[0]
+                .get("meta", {}).get("regularMarketPrice")
             )
 
-            # --- Build snapshot ---
             snap = {
-                "btc_usd": (cg.get("bitcoin", {}) or {}).get("usd"),
-                "eth_usd": (cg.get("ethereum", {}) or {}).get("usd"),
+                "btc_usd": btc_usd,
+                "eth_usd": eth_usd,
                 "eur_usd": fx.get("conversion_rate"),
                 "dax": dax_val,
                 "timestamp": time.time(),
@@ -339,16 +329,12 @@ def _insights_loop():
                 insights_snapshot = snap
             _log("INFO", f"✅ Insights updated: {snap}")
 
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                _log("INFO", "⚠️ CoinGecko rate limit hit. Backing off for 2 minutes.")
-                cooldown = 120  # wait 2 minutes
-            else:
-                _log("INFO", f"⚠️ Insights HTTP error: {e}")
         except Exception as e:
             _log("INFO", f"⚠️ Insights update failed: {e}")
+            cooldown = 60  # wait a bit if error
 
-        time.sleep(INSIGHTS_REFRESH + random.randint(0, 60))
+        time.sleep(INSIGHTS_REFRESH)
+
 
 # -----------
 # HTTP routes
