@@ -3,6 +3,7 @@ import time
 import json
 import threading
 import feedparser
+import random
 from typing import Dict, Tuple, List, Optional
 
 import requests
@@ -332,7 +333,7 @@ def _insights_loop():
         except Exception as e:
             _log("INFO", f"⚠️ Insights update failed: {e}")
 
-        time.sleep(INSIGHTS_REFRESH)
+        time.sleep(INSIGHTS_REFRESH + random.randint(0, 60))
 
 # -----------
 # HTTP routes
