@@ -51,10 +51,11 @@ INSIGHTS_REFRESH = 120 # 2 min
 app = Flask(__name__)
 _session = requests.Session()
 
-@app.before_first_request
+@app.before_serving
 def activate_background_threads():
     _log("INFO", "🚀 Bootstrapping background threads for Render...")
     start_threads()
+
 
 
 def _log(level: str, *args):
