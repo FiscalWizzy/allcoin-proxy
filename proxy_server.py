@@ -50,11 +50,6 @@ INSIGHTS_REFRESH = 60
 app = Flask(__name__)
 _session = requests.Session()
 
-# Ensure background loops start even under gunicorn
-if os.environ.get("RUN_MAIN") != "true":  # avoid duplicate threads in reloader
-    _log("INFO", "🚀 Bootstrapping background threads for Render...")
-    threading.Thread(target=start_threads, daemon=True).start()
-
 
 def _log(level: str, *args):
     if LOG_LEVEL == "DEBUG" or level != "DEBUG":
@@ -64,6 +59,12 @@ def http_get_json(url: str, timeout: float = 10.0, params: Optional[dict] = None
     resp = _session.get(url, timeout=timeout, params=params)
     resp.raise_for_status()
     return resp.json()
+
+# Ensure background loops start even under gunicorn
+if os.environ.get("RUN_MAIN") != "true":  # avoid duplicate threads in reloader
+    _log("INFO", "🚀 Bootstrapping background threads for Render...")
+    threading.Thread(target=start_threads, daemon=True).start()
+
 
 # -------------
 # In-memory cache
