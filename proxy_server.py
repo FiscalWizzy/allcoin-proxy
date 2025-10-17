@@ -42,7 +42,7 @@ RETURN_CANDLES = 200
 FIAT_REFRESH = 1800  # 30 min
 
 # Insights cadence (seconds)
-INSIGHTS_REFRESH = 60
+INSIGHTS_REFRESH = 120 # 2 min
 
 # -------------
 # Flask & HTTP
