@@ -45,16 +45,25 @@ FIAT_REFRESH = 1800  # 30 min
 # Insights cadence (seconds)
 INSIGHTS_REFRESH = 120 # 2 min
 
+_threads_started = False
+
+
 # -------------
 # Flask & HTTP
 # -------------
 app = Flask(__name__)
 _session = requests.Session()
 
-@app.before_serving
+_threads_started = False
+
+@app.before_request
 def activate_background_threads():
-    _log("INFO", "🚀 Bootstrapping background threads for Render...")
-    start_threads()
+    global _threads_started
+    if not _threads_started:
+        _threads_started = True
+        _log("INFO", "🚀 Bootstrapping background threads for Render (Flask 3.x)...")
+        start_threads()
+
 
 
 
