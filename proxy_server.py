@@ -51,6 +51,11 @@ INSIGHTS_REFRESH = 120 # 2 min
 app = Flask(__name__)
 _session = requests.Session()
 
+@app.before_first_request
+def activate_background_threads():
+    _log("INFO", "🚀 Bootstrapping background threads for Render...")
+    start_threads()
+
 
 def _log(level: str, *args):
     if LOG_LEVEL == "DEBUG" or level != "DEBUG":
@@ -393,6 +398,48 @@ def crypto_chart():
     # Return as server-expected [[ts_ms, o, h, l, c], ...] (your client divides by 1000 currently—keep consistent)
     out = [[int(r[0] * 1000), r[1], r[2], r[3], r[4]] for r in rows]
     return jsonify({"candles": out})
+
+@app.route("/convert")
+def convert():
+    """Convert fiat currencies using cached rates from fiat_board_snapshot."""
+    from_cur = request.args.get("from", "").upper()
+    to_cur = request.args.get("to", "").upper()
+    amount = request.args.get("amount", type=float, default=1.0)
+
+    with _cache_lock:
+        pairs = fiat_board_snapshot.get("pairs", {}) if fiat_board_snapshot else {}
+
+    # If no cache yet
+    if not pairs:
+        return jsonify({"error": "no cached fiat data yet"}), 503
+
+    # Build a small lookup using USD as the central base
+    usd_rates = {
+        "USD": 1.0,
+        "EUR": pairs.get("USD_EUR", {}).get("current"),
+        "JPY": pairs.get("USD_JPY", {}).get("current"),
+        "CHF": pairs.get("USD_CHF", {}).get("current"),
+        "CAD": pairs.get("USD_CAD", {}).get("current"),
+        "GBP": 1 / pairs.get("GBP_USD", {}).get("current") if pairs.get("GBP_USD") else None,
+        "AUD": 1 / pairs.get("AUD_USD", {}).get("current") if pairs.get("AUD_USD") else None,
+    }
+
+    # Validate requested currencies
+    if from_cur not in usd_rates or to_cur not in usd_rates or not usd_rates[from_cur] or not usd_rates[to_cur]:
+        return jsonify({"error": f"unsupported or missing pair {from_cur}/{to_cur}"}), 400
+
+    try:
+        amount_in_usd = amount / usd_rates[from_cur]
+        converted = amount_in_usd * usd_rates[to_cur]
+        return jsonify({
+            "from": from_cur,
+            "to": to_cur,
+            "amount": amount,
+            "converted": round(converted, 6)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/crypto-price")
 def crypto_price():
