@@ -50,6 +50,12 @@ INSIGHTS_REFRESH = 60
 app = Flask(__name__)
 _session = requests.Session()
 
+# Ensure background loops start even under gunicorn
+if os.environ.get("RUN_MAIN") != "true":  # avoid duplicate threads in reloader
+    _log("INFO", "🚀 Bootstrapping background threads for Render...")
+    threading.Thread(target=start_threads, daemon=True).start()
+
+
 def _log(level: str, *args):
     if LOG_LEVEL == "DEBUG" or level != "DEBUG":
         print(*args, flush=True)
@@ -399,6 +405,20 @@ def crypto_price():
     if not data:
         return jsonify({"error": "no cached data yet"}), 503
     return jsonify(data)
+
+@app.route("/debug")
+def debug_info():
+    with _cache_lock:
+        data = {
+            "candle_keys": list(candle_cache.keys())[:5],
+            "fiat_pairs": list(fiat_board_snapshot.get("pairs", {}).keys()) if fiat_board_snapshot else [],
+            "insights_ready": bool(insights_snapshot),
+            "last_price_count": len(last_price),
+            "thread_count": threading.active_count(),
+            "timestamp": time.time(),
+        }
+    return jsonify(data)
+
 
 # -------------------
 # Thread orchestration
