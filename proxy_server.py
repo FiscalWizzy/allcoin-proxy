@@ -483,7 +483,7 @@ def crypto_chart():
 
 @app.route("/convert")
 def convert():
-    """Convert fiat currencies using cached rates from fiat_board_snapshot."""
+    """Convert fiat currencies using the full cached rate set."""
     from_cur = request.args.get("from", "").upper()
     to_cur = request.args.get("to", "").upper()
     amount = request.args.get("amount", type=float, default=1.0)
@@ -491,23 +491,17 @@ def convert():
     with _cache_lock:
         pairs = fiat_board_snapshot.get("pairs", {}) if fiat_board_snapshot else {}
 
-    # If no cache yet
     if not pairs:
         return jsonify({"error": "no cached fiat data yet"}), 503
 
-    # Build a small lookup using USD as the central base
-    usd_rates = {
-        "USD": 1.0,
-        "EUR": pairs.get("USD_EUR", {}).get("current"),
-        "JPY": pairs.get("USD_JPY", {}).get("current"),
-        "CHF": pairs.get("USD_CHF", {}).get("current"),
-        "CAD": pairs.get("USD_CAD", {}).get("current"),
-        "GBP": 1 / pairs.get("GBP_USD", {}).get("current") if pairs.get("GBP_USD") else None,
-        "AUD": 1 / pairs.get("AUD_USD", {}).get("current") if pairs.get("AUD_USD") else None,
-    }
+    # Build a lookup of all currencies relative to USD
+    usd_rates = {"USD": 1.0}
+    for k, v in pairs.items():
+        if k.startswith("USD_"):
+            code = k.split("_", 1)[1]
+            usd_rates[code] = v.get("current")
 
-    # Validate requested currencies
-    if from_cur not in usd_rates or to_cur not in usd_rates or not usd_rates[from_cur] or not usd_rates[to_cur]:
+    if from_cur not in usd_rates or to_cur not in usd_rates:
         return jsonify({"error": f"unsupported or missing pair {from_cur}/{to_cur}"}), 400
 
     try:
@@ -521,6 +515,7 @@ def convert():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 
 @app.route("/crypto-price")
