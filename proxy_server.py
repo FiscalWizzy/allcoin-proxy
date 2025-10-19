@@ -599,15 +599,25 @@ def save_cache():
 
 
 
-# ----------------------------
-# Guaranteed background start
-# ----------------------------
+# -----
+# Main
+# -----
 if __name__ == "__main__":
-    _log("INFO", "🚀 Starting background threads (local run)…")
+    _log("INFO", "🚀 Local start detected – loading cache and starting threads.")
     _load_cache()
     start_threads()
+    _log("INFO", "✅ Threads started. Serving Flask on 0.0.0.0:8080")
+
+    # Background periodic saver
+    threading.Thread(target=lambda: (time.sleep(5), _periodic_save()), daemon=True).start()
+
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+
 else:
-    _log("INFO", "🚀 Starting background threads (Render/Gunicorn)…")
+    _log("INFO", "🚀 Gunicorn/Render environment detected – loading cache and starting threads.")
+    _load_cache()
     threading.Thread(target=start_threads, daemon=True).start()
+
+    # Background periodic saver
+    threading.Thread(target=lambda: (time.sleep(5), _periodic_save()), daemon=True).start()
 
