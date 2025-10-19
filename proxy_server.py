@@ -207,6 +207,22 @@ def _fetch_klines(symbol: str, interval: str, limit: int = 200, end_time_ms: Opt
     url = f"{BINANCE_API}/api/v3/klines"
     return http_get_json(url, timeout=10, params=params)
 
+def _bounded_extend(key, new_rows):
+    """Append new candle rows to cache and cap list length."""
+    with _cache_lock:
+        cur = candle_cache.get(key, [])
+        if cur and new_rows and new_rows[0][0] <= cur[-1][0]:
+            # Overlapping: remove duplicates by timestamp
+            ts_set = {t for (t, *_rest) in cur}
+            cur.extend([row for row in new_rows if row[0] not in ts_set])
+        else:
+            cur.extend(new_rows)
+        # Keep cache bounded
+        if len(cur) > MAX_CANDLES_PER_KEY:
+            cur = cur[-MAX_CANDLES_PER_KEY:]
+        candle_cache[key] = cur
+
+
 def _backfill_history(interval: str):
     """One-time startup backfill for each tracked symbol."""
     symbols = TRACKED_SYMBOLS[:]
