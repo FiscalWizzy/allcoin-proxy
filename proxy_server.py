@@ -46,7 +46,7 @@ FIAT_REFRESH = 1800  # 30 min
 INSIGHTS_REFRESH = 120 # 2 min
 
 _threads_started = False
-
+STRICT_CACHE_ONLY = True  # do not hit Binance inside request handler
 
 # -------------
 # Flask & HTTP
@@ -113,20 +113,30 @@ def _normalize_klines(raw_klines) -> List[Tuple[float, float, float, float, floa
             continue
     return out
 
-def _bounded_extend(key, new_rows):
-    """Append and cap to MAX_CANDLES_PER_KEY."""
+def _merge_extend(key, new_rows):
+    """Upsert by timestamp and cap to MAX_CANDLES_PER_KEY."""
     with _cache_lock:
         cur = candle_cache.get(key, [])
-        if cur and new_rows and new_rows[0][0] <= cur[-1][0]:
-            # If overlapping, drop duplicates by timestamp
-            ts_set = {t for (t, *_rest) in cur}
-            cur.extend([row for row in new_rows if row[0] not in ts_set])
-        else:
-            cur.extend(new_rows)
-        # Cap
+        if not cur:
+            # First fill
+            candle_cache[key] = new_rows[-MAX_CANDLES_PER_KEY:]
+            return
+
+        # Build an index for fast overwrite
+        idx = {t: i for i, (t, *_rest) in enumerate(cur)}
+        for row in new_rows:
+            t = row[0]
+            if t in idx:
+                cur[idx[t]] = row  # overwrite existing candle for same openTime
+            else:
+                cur.append(row)    # append newer candle
+
+        # Cap memory
         if len(cur) > MAX_CANDLES_PER_KEY:
             cur = cur[-MAX_CANDLES_PER_KEY:]
+
         candle_cache[key] = cur
+
 
 def _get_cached_slice(key, end_ts: Optional[float], limit: int) -> List[Tuple[float, float, float, float, float]]:
     with _cache_lock:
@@ -138,6 +148,45 @@ def _get_cached_slice(key, end_ts: Optional[float], limit: int) -> List[Tuple[fl
         # filter rows strictly older-or-equal to end_ts
         filtered = [r for r in rows if r[0] <= end_ts]
         return filtered[-limit:] if filtered else []
+
+
+
+def _backfill_history(interval: str, pages: int = 20, page_limit: int = 500):
+    """
+    Fill cache with older candles for all symbols.
+    Fetches `pages` chunks backwards using `endTime` pagination.
+    """
+    for sym in TRACKED_SYMBOLS:
+        try:
+            key = (sym, interval)
+            # If we already have some, start from oldest we have
+            with _cache_lock:
+                existing = candle_cache.get(key, [])
+                oldest_ms = int(existing[0][0] * 1000) if existing else None
+
+            end_time_ms = oldest_ms
+            for _ in range(pages):
+                params = {"symbol": sym, "interval": interval, "limit": page_limit}
+                if end_time_ms:
+                    params["endTime"] = end_time_ms - 1  # strict older page
+
+                raw = http_get_json(f"{BINANCE_API}/api/v3/klines", timeout=10, params=params)
+                rows = _normalize_klines(raw)
+                if not rows:
+                    break
+
+                # Merge older block into cache
+                _merge_extend(key, rows)
+
+                # Prepare next page end time (ms of first record in this batch)
+                end_time_ms = int(rows[0][0] * 1000)
+
+            _log("INFO", f"📥 Backfilled {sym} {interval}: {len(candle_cache.get(key, []))} candles")
+
+        except Exception as e:
+            _log("INFO", f"⚠️ Backfill failed {sym} {interval}: {e}")
+
+
 
 # --------------------------
 # Background: Crypto candles
@@ -156,7 +205,7 @@ def _update_candles_for(symbols: List[str], interval: str):
             rows = _normalize_klines(raw)
             if not rows:
                 continue
-            _bounded_extend((sym, interval), rows)
+            _merge_extend((sym, interval), rows)
             # Update last price from the last close
             with _cache_lock:
                 last_price[sym] = rows[-1][4]
@@ -363,10 +412,9 @@ def insights():
 def crypto_chart():
     symbol = request.args.get("symbol", "BTCUSDT").upper()
     interval = request.args.get("interval", "1m")
-    end_time = request.args.get("endTime")  # ms since epoch (Binance style) (optional)
+    end_time = request.args.get("endTime")   # optional ms
     limit = int(request.args.get("limit", str(RETURN_CANDLES)))
 
-    # Serve from cache; if cache is empty and endTime provided, attempt on-demand fill for that slice
     end_ts = None
     if end_time:
         try:
@@ -377,23 +425,14 @@ def crypto_chart():
     key = (symbol, interval)
     rows = _get_cached_slice(key, end_ts=end_ts, limit=limit)
 
-    if not rows and end_time:
-        # Optional: cache-first but try to fetch older slice if asked explicitly
-        try:
-            raw = _fetch_klines(symbol, interval, limit=limit, end_time_ms=int(end_time))
-            older = _normalize_klines(raw)
-            if older:
-                _bounded_extend(key, older)
-                rows = _get_cached_slice(key, end_ts=end_ts, limit=limit)
-        except Exception as e:
-            _log("INFO", f"⚠️ On-demand candle fetch failed {symbol} {interval}: {e}")
-
+    # STRICT cache behavior: if not in cache, just say so quickly (no slow fetch)
     if not rows:
         return jsonify({"error": "no cached data yet"}), 503
 
-    # Return as server-expected [[ts_ms, o, h, l, c], ...] (your client divides by 1000 currently—keep consistent)
     out = [[int(r[0] * 1000), r[1], r[2], r[3], r[4]] for r in rows]
     return jsonify({"candles": out})
+
+
 
 @app.route("/convert")
 def convert():
@@ -449,8 +488,10 @@ def crypto_price():
 @app.route("/debug")
 def debug_info():
     with _cache_lock:
+        counts = {f"{k[0]}:{k[1]}": len(v) for k, v in candle_cache.items()}
         data = {
-            "candle_keys": list(candle_cache.keys())[:5],
+            "keys": list(counts.keys())[:10],
+            "sizes": {k: counts[k] for k in list(counts)[:10]},
             "fiat_pairs": list(fiat_board_snapshot.get("pairs", {}).keys()) if fiat_board_snapshot else [],
             "insights_ready": bool(insights_snapshot),
             "last_price_count": len(last_price),
@@ -460,36 +501,34 @@ def debug_info():
     return jsonify(data)
 
 
+
 # -------------------
 # Thread orchestration
 # -------------------
 def start_threads():
-    # Four candle threads (one per interval) to decouple cadences
+    # Live updaters
     for iv in TRACKED_INTERVALS:
         t = threading.Thread(target=_candles_loop, args=(iv,), daemon=True)
         t.start()
 
-    # Fiat board
+    # Backfill (run one per interval so it doesn’t block)
+    for iv in TRACKED_INTERVALS:
+        threading.Thread(target=_backfill_history, args=(iv,), daemon=True).start()
+
     threading.Thread(target=_fiat_board_loop, daemon=True).start()
-
-    # Frankfurter instant delta loop
     threading.Thread(target=_frankfurter_delta_loop, daemon=True).start()
-
-    # Insights
     threading.Thread(target=_insights_loop, daemon=True).start()
 
 
-# ✅ Start threads automatically on Render (after function exists)
-if os.environ.get("RUN_MAIN") != "true":
-    _log("INFO", "🚀 Bootstrapping background threads for Render...")
+
+# ----------------------------
+# Guaranteed background start
+# ----------------------------
+if __name__ == "__main__":
+    _log("INFO", "🚀 Starting background threads (local run)…")
+    start_threads()
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+else:
+    _log("INFO", "🚀 Starting background threads (Render/Gunicorn)…")
     threading.Thread(target=start_threads, daemon=True).start()
 
-# -----
-# Main
-# -----
-if __name__ == "__main__":
-    _log("INFO", "🚀 Starting background threads…")
-    start_threads()
-    _log("INFO", "✅ Threads started. Serving Flask on 0.0.0.0:8080")
-    # For Cloud Run, debug=False is recommended
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
