@@ -228,42 +228,58 @@ def _candles_loop(interval: str):
 # Background: Fiat board
 # -----------------------
 def _fiat_board_loop():
+    """Background thread: fetch full fiat cross-rates and cache them for conversions + board display."""
     global fiat_board_snapshot, last_fiat_rates
+
     while True:
         try:
-            usd = http_get_json(f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/USD", timeout=10)
-            eur = http_get_json(f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/EUR", timeout=10)
-
+            # --- Fetch base USD rates from ExchangeRate API ---
+            usd = http_get_json(
+                f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/USD",
+                timeout=10
+            )
             usd_rates = usd.get("conversion_rates", {}) or {}
-            eur_rates = eur.get("conversion_rates", {}) or {}
 
-            pairs = {
-                "USD_EUR": usd_rates.get("EUR"),
-                "GBP_USD": (1 / usd_rates["GBP"]) if usd_rates.get("GBP") else None,
-                "USD_JPY": usd_rates.get("JPY"),
-                "USD_CHF": usd_rates.get("CHF"),
-                "AUD_USD": (1 / usd_rates["AUD"]) if usd_rates.get("AUD") else None,
-                "USD_CAD": usd_rates.get("CAD"),
-                "EUR_GBP": eur_rates.get("GBP"),
-            }
-
-            # Build snapshot with previous/current
+            # --- Build full cross-rate table dynamically ---
             with _cache_lock:
-                pairs_out = {}
-                for k, cur in pairs.items():
-                    prev = last_fiat_rates.get(k)
-                    if prev is None:
-                        # first run: neutral baseline
-                        pairs_out[k] = {"current": cur, "previous": cur}
-                    else:
-                        pairs_out[k] = {"current": cur, "previous": prev}
-                    last_fiat_rates[k] = cur
-                fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
+                all_pairs = {}
+                currencies = list(usd_rates.keys())
 
-            _log("INFO", "✅ Fiat board refreshed")
+                for base in currencies:
+                    for quote in currencies:
+                        if base == quote:
+                            continue
+                        try:
+                            base_to_usd = 1 / usd_rates[base] if base != "USD" else 1.0
+                            usd_to_quote = usd_rates[quote]
+                            rate = base_to_usd * usd_to_quote
+
+                            prev = last_fiat_rates.get(f"{base}_{quote}")
+                            # detect small change for red/green flicker logic later
+                            if prev is None:
+                                prev = rate
+
+                            all_pairs[f"{base}_{quote}"] = {
+                                "current": rate,
+                                "previous": prev,
+                            }
+                            last_fiat_rates[f"{base}_{quote}"] = rate
+                        except Exception:
+                            continue
+
+                fiat_board_snapshot = {
+                    "pairs": all_pairs,
+                    "timestamp": time.time(),
+                }
+
+            _log("INFO", f"✅ Fiat board refreshed with {len(all_pairs)} pairs")
+
         except Exception as e:
             _log("INFO", f"⚠️ Fiat board update failed: {e}")
+
+        # --- Wait for next refresh cycle ---
         time.sleep(FIAT_REFRESH)
+
 
 # -----------------------
 # Background: Frankfurter live delta
