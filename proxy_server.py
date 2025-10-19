@@ -205,7 +205,16 @@ def _fetch_klines(symbol: str, interval: str, limit: int = 200, end_time_ms: Opt
     if end_time_ms is not None:
         params["endTime"] = end_time_ms
     url = f"{BINANCE_API}/api/v3/klines"
-    return http_get_json(url, timeout=10, params=params)
+
+    for attempt in range(3):  # up to 3 retries
+        try:
+            return http_get_json(url, timeout=10, params=params)
+        except requests.exceptions.RequestException as e:
+            wait = 2 ** attempt
+            _log("INFO", f"⚠️ Retry {attempt+1}/3 for {symbol} {interval} after {wait}s: {e}")
+            time.sleep(wait)
+    raise Exception(f"❌ Failed to fetch {symbol} {interval} after 3 retries")
+
 
 def _bounded_extend(key, new_rows):
     """Append new candle rows to cache and cap list length."""
@@ -226,30 +235,50 @@ def _bounded_extend(key, new_rows):
 def _backfill_history(interval: str):
     """One-time startup backfill for each tracked symbol."""
     symbols = TRACKED_SYMBOLS[:]
+    total_symbols = len(symbols)
+    completed = 0
+
     for sym in symbols:
         try:
             _log("INFO", f"⬅️ Backfilling {sym} {interval}…")
-            # Fetch up to 5000 candles (Binance limit per request = 1000)
             end_time = int(time.time() * 1000)
             all_rows = []
+
             for _ in range(5):  # 5 × 1000 = 5000 max
-                raw = _fetch_klines(sym, interval, limit=1000, end_time_ms=end_time)
+                # Retry wrapper for robustness
+                for attempt in range(3):
+                    try:
+                        raw = _fetch_klines(sym, interval, limit=1000, end_time_ms=end_time)
+                        break
+                    except Exception as e:
+                        wait = 2 ** attempt
+                        _log("INFO", f"⚠️ Retry {attempt+1}/3 for {sym} {interval} after {wait}s: {e}")
+                        time.sleep(wait)
+                else:
+                    _log("INFO", f"❌ Skipping {sym} {interval} after 3 retries")
+                    break
+
                 rows = _normalize_klines(raw)
                 if not rows:
                     break
                 all_rows = rows + all_rows
                 end_time = int(rows[0][0] * 1000) - 1  # move backward
-                time.sleep(0.3)  # throttle to avoid 429
+                time.sleep(0.3)  # throttle to avoid 429s
+
             if all_rows:
                 _bounded_extend((sym, interval), all_rows)
                 with _cache_lock:
                     last_price[sym] = all_rows[-1][4]
             _log("INFO", f"✅ Backfilled {sym} {interval}: {len(all_rows)} candles")
+
         except Exception as e:
             _log("INFO", f"⚠️ Backfill failed {sym} {interval}: {e}")
 
+        completed += 1
+        _log("INFO", f"🎯 Backfill progress {interval}: ({completed}/{total_symbols})")
 
-    _log("INFO", f"🎯 Backfill complete for interval {interval} ({completed}/{total_symbols})")
+    _log("INFO", f"🎉 Backfill complete for interval {interval}")
+
 
     # --- Track global backfill completion ---
     global _backfill_done
@@ -355,17 +384,18 @@ def _fiat_board_loop():
 # Thread orchestration
 # -------------------
 def start_threads():
-    # --- One-time backfill threads (run and stop) ---
-    for iv in TRACKED_INTERVALS:
-        threading.Thread(target=_backfill_history, args=(iv,), daemon=True).start()
-
-    # --- Continuous live update threads ---
+    # Live updaters
     for iv in TRACKED_INTERVALS:
         threading.Thread(target=_candles_loop, args=(iv,), daemon=True).start()
 
-    # --- Other background services ---
+    # Staggered backfill (to avoid RAM spike)
+    for idx, iv in enumerate(TRACKED_INTERVALS):
+        threading.Timer(idx * 10, lambda iv=iv: _backfill_history(iv)).start()
+
+    # Other loops
     threading.Thread(target=_fiat_board_loop, daemon=True).start()
     threading.Thread(target=_insights_loop, daemon=True).start()
+
 
 
 def _periodic_save():
