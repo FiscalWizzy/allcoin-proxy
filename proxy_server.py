@@ -48,6 +48,7 @@ INSIGHTS_REFRESH = 120 # 2 min
 _threads_started = False
 STRICT_CACHE_ONLY = True  # do not hit Binance inside request handler
 
+
 # -----------------------
 # Persistence paths
 # -----------------------
@@ -57,6 +58,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 CANDLE_FILE = os.path.join(DATA_DIR, "candles.json")
 FIAT_FILE = os.path.join(DATA_DIR, "fiat.json")
 INSIGHTS_FILE = os.path.join(DATA_DIR, "insights.json")
+
+_backfill_done = {iv: False for iv in TRACKED_INTERVALS}
 
 
 # -------------
@@ -194,43 +197,6 @@ def _get_cached_slice(key, end_ts: Optional[float], limit: int) -> List[Tuple[fl
 
 
 
-def _backfill_history(interval: str, pages: int = 20, page_limit: int = 500):
-    """
-    Fill cache with older candles for all symbols.
-    Fetches `pages` chunks backwards using `endTime` pagination.
-    """
-    for sym in TRACKED_SYMBOLS:
-        try:
-            key = (sym, interval)
-            # If we already have some, start from oldest we have
-            with _cache_lock:
-                existing = candle_cache.get(key, [])
-                oldest_ms = int(existing[0][0] * 1000) if existing else None
-
-            end_time_ms = oldest_ms
-            for _ in range(pages):
-                params = {"symbol": sym, "interval": interval, "limit": page_limit}
-                if end_time_ms:
-                    params["endTime"] = end_time_ms - 1  # strict older page
-
-                raw = http_get_json(f"{BINANCE_API}/api/v3/klines", timeout=10, params=params)
-                rows = _normalize_klines(raw)
-                if not rows:
-                    break
-
-                # Merge older block into cache
-                _merge_extend(key, rows)
-
-                # Prepare next page end time (ms of first record in this batch)
-                end_time_ms = int(rows[0][0] * 1000)
-
-            _log("INFO", f"📥 Backfilled {sym} {interval}: {len(candle_cache.get(key, []))} candles")
-
-        except Exception as e:
-            _log("INFO", f"⚠️ Backfill failed {sym} {interval}: {e}")
-
-
-
 # --------------------------
 # Background: Crypto candles
 # --------------------------
@@ -240,6 +206,43 @@ def _fetch_klines(symbol: str, interval: str, limit: int = 200, end_time_ms: Opt
         params["endTime"] = end_time_ms
     url = f"{BINANCE_API}/api/v3/klines"
     return http_get_json(url, timeout=10, params=params)
+
+def _backfill_history(interval: str):
+    """One-time startup backfill for each tracked symbol."""
+    symbols = TRACKED_SYMBOLS[:]
+    for sym in symbols:
+        try:
+            _log("INFO", f"⬅️ Backfilling {sym} {interval}…")
+            # Fetch up to 5000 candles (Binance limit per request = 1000)
+            end_time = int(time.time() * 1000)
+            all_rows = []
+            for _ in range(5):  # 5 × 1000 = 5000 max
+                raw = _fetch_klines(sym, interval, limit=1000, end_time_ms=end_time)
+                rows = _normalize_klines(raw)
+                if not rows:
+                    break
+                all_rows = rows + all_rows
+                end_time = int(rows[0][0] * 1000) - 1  # move backward
+                time.sleep(0.3)  # throttle to avoid 429
+            if all_rows:
+                _bounded_extend((sym, interval), all_rows)
+                with _cache_lock:
+                    last_price[sym] = all_rows[-1][4]
+            _log("INFO", f"✅ Backfilled {sym} {interval}: {len(all_rows)} candles")
+        except Exception as e:
+            _log("INFO", f"⚠️ Backfill failed {sym} {interval}: {e}")
+
+
+    _log("INFO", f"🎯 Backfill complete for interval {interval} ({completed}/{total_symbols})")
+
+    # --- Track global backfill completion ---
+    global _backfill_done
+    with _cache_lock:
+        _backfill_done[interval] = True
+
+    if all(_backfill_done.get(iv, False) for iv in TRACKED_INTERVALS):
+        _log("INFO", "🎉 All intervals backfilled successfully!")
+
 
 def _update_candles_for(symbols: List[str], interval: str):
     for sym in symbols:
@@ -336,21 +339,18 @@ def _fiat_board_loop():
 # Thread orchestration
 # -------------------
 def start_threads():
-    """Spawn background threads for candles, backfill, fiat board, and insights."""
-    # Live candle updates (1m, 5m, 1h, 1d)
-    for iv in TRACKED_INTERVALS:
-        t = threading.Thread(target=_candles_loop, args=(iv,), daemon=True)
-        t.start()
-
-    # Historical backfill for each interval
+    # --- One-time backfill threads (run and stop) ---
     for iv in TRACKED_INTERVALS:
         threading.Thread(target=_backfill_history, args=(iv,), daemon=True).start()
 
-    # Fiat board (no Frankfurter delta anymore)
-    threading.Thread(target=_fiat_board_loop, daemon=True).start()
+    # --- Continuous live update threads ---
+    for iv in TRACKED_INTERVALS:
+        threading.Thread(target=_candles_loop, args=(iv,), daemon=True).start()
 
-    # Insights (BTC, ETH, DAX, etc.)
+    # --- Other background services ---
+    threading.Thread(target=_fiat_board_loop, daemon=True).start()
     threading.Thread(target=_insights_loop, daemon=True).start()
+
 
 def _periodic_save():
     while True:
@@ -369,68 +369,6 @@ def _self_ping():
         time.sleep(600)  # every 10 minutes
 
 threading.Thread(target=_self_ping, daemon=True).start()
-
-
-# -----------------------
-# Background: Frankfurter live delta
-# -----------------------
-def _frankfurter_delta_loop():
-    """Compare cached fiat rates with Frankfurter's live data every 60s."""
-    global fiat_board_snapshot, last_fiat_rates
-    while True:
-        time.sleep(60)  # check every minute
-        try:
-            frank = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=8)
-            rates = frank.get("rates", {}) or {}
-
-            # Only update pairs we already track
-            with _cache_lock:
-                if not fiat_board_snapshot:
-                    continue
-
-                pairs_out = fiat_board_snapshot.get("pairs", {}).copy()
-                changed = False
-
-                for pair in list(pairs_out.keys()):
-                    if pair == "USD_EUR":
-                        new_val = rates.get("EUR")
-                    elif pair == "USD_JPY":
-                        new_val = rates.get("JPY")
-                    elif pair == "USD_CHF":
-                        new_val = rates.get("CHF")
-                    elif pair == "USD_CAD":
-                        new_val = rates.get("CAD")
-                    elif pair == "AUD_USD":
-                        aud = rates.get("AUD")
-                        new_val = (1 / aud) if aud else None
-                    elif pair == "GBP_USD":
-                        gbp = rates.get("GBP")
-                        new_val = (1 / gbp) if gbp else None
-                    elif pair == "EUR_GBP":
-                        # Use Frankfurter’s EUR base for this one
-                        eur = http_get_json("https://api.frankfurter.app/latest?from=EUR", timeout=5)
-                        new_val = eur.get("rates", {}).get("GBP")
-                    else:
-                        continue
-
-                    if not new_val:
-                        continue
-
-                    prev_val = pairs_out[pair]["current"]
-                    # Only update if difference > 0.0001 (avoid flicker)
-                    if abs(new_val - prev_val) > 0.0001:
-                        pairs_out[pair]["previous"] = prev_val
-                        pairs_out[pair]["current"] = new_val
-                        last_fiat_rates[pair] = new_val
-                        changed = True
-
-                if changed:
-                    fiat_board_snapshot["pairs"] = pairs_out
-                    fiat_board_snapshot["timestamp"] = time.time()
-                    _log("INFO", "⚡ Fiat board instantly refreshed via Frankfurter")
-
-        except Exception as e:
-            _log("INFO", f"⚠️ Frankfurter delta check failed: {e}")
 
 
 # -----------------------
