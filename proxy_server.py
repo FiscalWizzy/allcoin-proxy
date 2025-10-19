@@ -48,6 +48,17 @@ INSIGHTS_REFRESH = 120 # 2 min
 _threads_started = False
 STRICT_CACHE_ONLY = True  # do not hit Binance inside request handler
 
+# -----------------------
+# Persistence paths
+# -----------------------
+DATA_DIR = "/tmp/allcoin_cache"  # Render allows writing to /tmp
+os.makedirs(DATA_DIR, exist_ok=True)
+
+CANDLE_FILE = os.path.join(DATA_DIR, "candles.json")
+FIAT_FILE = os.path.join(DATA_DIR, "fiat.json")
+INSIGHTS_FILE = os.path.join(DATA_DIR, "insights.json")
+
+
 # -------------
 # Flask & HTTP
 # -------------
@@ -93,6 +104,38 @@ fiat_board_snapshot: Dict = {}
 
 # Insights snapshot
 insights_snapshot: Dict = {}
+
+def _save_cache():
+    """Persist in-memory caches to disk."""
+    with _cache_lock:
+        try:
+            with open(CANDLE_FILE, "w") as f:
+                json.dump(candle_cache, f)
+            with open(FIAT_FILE, "w") as f:
+                json.dump(fiat_board_snapshot, f)
+            with open(INSIGHTS_FILE, "w") as f:
+                json.dump(insights_snapshot, f)
+            _log("INFO", "💾 Cache saved successfully.")
+        except Exception as e:
+            _log("INFO", f"⚠️ Cache save failed: {e}")
+
+def _load_cache():
+    """Load cached data from disk if present."""
+    global candle_cache, fiat_board_snapshot, insights_snapshot
+    try:
+        if os.path.exists(CANDLE_FILE):
+            with open(CANDLE_FILE, "r") as f:
+                candle_cache = json.load(f)
+        if os.path.exists(FIAT_FILE):
+            with open(FIAT_FILE, "r") as f:
+                fiat_board_snapshot = json.load(f)
+        if os.path.exists(INSIGHTS_FILE):
+            with open(INSIGHTS_FILE, "r") as f:
+                insights_snapshot = json.load(f)
+        _log("INFO", "♻️ Cache restored from disk.")
+    except Exception as e:
+        _log("INFO", f"⚠️ Cache load failed: {e}")
+
 
 # ---------------------------
 # Helpers for candle merging
@@ -309,6 +352,12 @@ def start_threads():
     # Insights (BTC, ETH, DAX, etc.)
     threading.Thread(target=_insights_loop, daemon=True).start()
 
+def _periodic_save():
+    while True:
+        time.sleep(300)  # every 5 minutes
+        _save_cache()
+
+threading.Thread(target=_periodic_save, daemon=True).start()
 
 
 
@@ -542,6 +591,11 @@ def debug_info():
         }
     return jsonify(data)
 
+@app.route("/save-cache")
+def save_cache():
+    _save_cache()
+    return jsonify({"status": "saved", "time": time.time()})
+
 
 
 
@@ -550,6 +604,7 @@ def debug_info():
 # ----------------------------
 if __name__ == "__main__":
     _log("INFO", "🚀 Starting background threads (local run)…")
+    _load_cache()
     start_threads()
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
 else:
