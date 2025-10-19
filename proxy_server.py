@@ -144,7 +144,6 @@ def _load_cache():
 # Helpers for candle merging
 # ---------------------------
 def _normalize_klines(raw_klines) -> List[Tuple[float, float, float, float, float]]:
-    # Binance kline: [openTime, open, high, low, close, volume, closeTime, ...]
     out = []
     for c in raw_klines:
         try:
@@ -157,7 +156,9 @@ def _normalize_klines(raw_klines) -> List[Tuple[float, float, float, float, floa
             ))
         except Exception:
             continue
+    out.sort(key=lambda x: x[0])  # ✅ ensure chronological order
     return out
+
 
 def _merge_extend(key, new_rows):
     """Upsert by timestamp and cap to MAX_CANDLES_PER_KEY."""
@@ -220,16 +221,16 @@ def _bounded_extend(key, new_rows):
     """Append new candle rows to cache and cap list length."""
     with _cache_lock:
         cur = candle_cache.get(key, [])
-        if cur and new_rows and new_rows[0][0] <= cur[-1][0]:
-            # Overlapping: remove duplicates by timestamp
-            ts_set = {t for (t, *_rest) in cur}
-            cur.extend([row for row in new_rows if row[0] not in ts_set])
-        else:
-            cur.extend(new_rows)
-        # Keep cache bounded
-        if len(cur) > MAX_CANDLES_PER_KEY:
-            cur = cur[-MAX_CANDLES_PER_KEY:]
-        candle_cache[key] = cur
+        all_rows = cur + new_rows
+        # Deduplicate by timestamp
+        seen = {}
+        for ts, o, h, l, c in sorted(all_rows, key=lambda r: r[0]):
+            seen[ts] = (ts, o, h, l, c)
+        merged = list(seen.values())
+        if len(merged) > MAX_CANDLES_PER_KEY:
+            merged = merged[-MAX_CANDLES_PER_KEY:]
+        candle_cache[key] = merged
+
 
 
 def _backfill_history(interval: str):
