@@ -19,6 +19,36 @@ COINGECKO_API = os.environ.get("COINGECKO_API", "https://api.coingecko.com/api/v
 PORT = int(os.environ.get("PORT", "8080"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")  # "DEBUG" to be chatty
 
+# -----------------------
+# Exchange rate caching
+# -----------------------
+EXCHANGE_CACHE = {}
+EXCHANGE_TTL = 1800  # cache for 30 minutes
+
+def get_exchange_rate_cached(base: str, quote: str):
+    """Return cached EUR/USD etc., refreshing from ExchangeRate API if needed."""
+    pair = f"{base}_{quote}"
+    now = time.time()
+
+    # ✅ Use cached value if still fresh
+    if pair in EXCHANGE_CACHE and now - EXCHANGE_CACHE[pair]["time"] < EXCHANGE_TTL:
+        return EXCHANGE_CACHE[pair]["value"]
+
+    try:
+        url = f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/pair/{base}/{quote}"
+        data = http_get_json(url, timeout=10)
+        val = data.get("conversion_rate")
+        if val is not None:
+            EXCHANGE_CACHE[pair] = {"value": val, "time": now}
+            _log("INFO", f"💾 Cached {pair}: {val}")
+            return val
+    except Exception as e:
+        _log("INFO", f"⚠️ Cached rate fetch failed for {pair}: {e}")
+
+    # fallback to previous cached value if exists
+    return EXCHANGE_CACHE.get(pair, {}).get("value", None)
+
+
 # Adaptive refresh cadence (seconds)
 CADENCE = {
     "1m": 5,
@@ -43,7 +73,7 @@ RETURN_CANDLES = 200
 FIAT_REFRESH = 1800  # 30 min
 
 # Insights cadence (seconds)
-INSIGHTS_REFRESH = 120 # 2 min
+INSIGHTS_REFRESH = 1800 # 30 min
 
 _threads_started = False
 STRICT_CACHE_ONLY = True  # do not hit Binance inside request handler
@@ -381,10 +411,109 @@ def _fiat_board_loop():
 # (Keep your _insights_loop(), candle threads, etc. here — unchanged)
 
 
+def warmup_insights():
+    """Instantly populate the insights snapshot on startup, with auto-retry."""
+    global insights_snapshot
+    retry_delay = 120  # seconds
+
+    while True:
+        try:
+            _log("INFO", "⚡ Running startup warm-up for insights…")
+
+            # BTC & ETH
+            btc_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=8)
+            eth_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=8)
+            btc_usd = float(btc_resp.json().get("price", 0))
+            eth_usd = float(eth_resp.json().get("price", 0))
+
+            # EUR/USD (cached call to avoid 429s)
+            eur_usd = get_exchange_rate_cached("EUR", "USD")
+
+            # DAX (Yahoo)
+            headers = {"User-Agent": "Mozilla/5.0"}
+            dax_resp = requests.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/%5EGDAXI",
+                params={"interval": "1h"},
+                headers=headers,
+                timeout=8,
+            )
+            dax_json = dax_resp.json()
+            dax_val = (
+                dax_json.get("chart", {}).get("result", [{}])[0]
+                .get("meta", {}).get("regularMarketPrice")
+            )
+
+            if not all([btc_usd, eth_usd, eur_usd, dax_val]):
+                raise ValueError("One or more warm-up values are missing")
+
+            with _cache_lock:
+                insights_snapshot = {
+                    "btc_usd": btc_usd,
+                    "eth_usd": eth_usd,
+                    "eur_usd": eur_usd,
+                    "dax": dax_val,
+                    "timestamp": time.time(),
+                }
+
+            _log("INFO", f"✅ Warm-up complete — BTC={btc_usd}, ETH={eth_usd}, EUR/USD={eur_usd}, DAX={dax_val}")
+            break  # ✅ success → stop retrying
+
+        except Exception as e:
+            _log("INFO", f"⚠️ Warm-up failed: {e} — retrying in {retry_delay}s")
+            time.sleep(retry_delay)
+
+
+def warmup_fiat_board():
+    """Instantly populate fiat_board_snapshot on startup, with auto-retry."""
+    global fiat_board_snapshot, last_fiat_rates
+    retry_delay = 120  # seconds
+
+    while True:
+        try:
+            _log("INFO", "⚡ Running startup warm-up for fiat board…")
+
+            usd = http_get_json(f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/USD", timeout=10)
+            eur = http_get_json(f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/EUR", timeout=10)
+
+            usd_rates = usd.get("conversion_rates", {}) or {}
+            eur_rates = eur.get("conversion_rates", {}) or {}
+
+            pairs = {
+                "USD_EUR": usd_rates.get("EUR"),
+                "GBP_USD": (1 / usd_rates["GBP"]) if usd_rates.get("GBP") else None,
+                "USD_JPY": usd_rates.get("JPY"),
+                "USD_CHF": usd_rates.get("CHF"),
+                "AUD_USD": (1 / usd_rates["AUD"]) if usd_rates.get("AUD") else None,
+                "USD_CAD": usd_rates.get("CAD"),
+                "EUR_GBP": eur_rates.get("GBP"),
+            }
+
+            with _cache_lock:
+                pairs_out = {}
+                for k, cur in pairs.items():
+                    if cur is None:
+                        continue
+                    prev = last_fiat_rates.get(k, cur)
+                    pairs_out[k] = {"current": cur, "previous": prev}
+                    last_fiat_rates[k] = cur
+                fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
+
+            _log("INFO", f"✅ Fiat board warm-up complete with {len(pairs_out)} pairs.")
+            break  # ✅ success → stop retrying
+
+        except Exception as e:
+            _log("INFO", f"⚠️ Fiat board warm-up failed: {e} — retrying in {retry_delay}s")
+            time.sleep(retry_delay)
+
+
 # -------------------
 # Thread orchestration
 # -------------------
 def start_threads():
+    # --- Warm-up before starting background loops ---
+    warmup_insights()
+    warmup_fiat_board()
+
     # Live updaters
     for iv in TRACKED_INTERVALS:
         threading.Thread(target=_candles_loop, args=(iv,), daemon=True).start()
@@ -438,11 +567,18 @@ def _insights_loop():
             btc_usd = float(btc_resp.json()["price"])
             eth_usd = float(eth_resp.json()["price"])
 
-            # --- EUR/USD from ExchangeRate API ---
-            fx = http_get_json(
-                f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/pair/EUR/USD",
-                timeout=8,
-            )
+            # --- EUR/USD (cached to avoid 429s) ---
+            eur_usd = get_exchange_rate_cached("EUR", "USD")
+
+            # Optional fallback if ExchangeRate API is still down
+            if eur_usd is None:
+                try:
+                    fb = http_get_json("https://api.frankfurter.app/latest?from=EUR&to=USD", timeout=8)
+                    eur_usd = fb["rates"]["USD"]
+                    _log("INFO", "🌍 Used Frankfurter fallback for EUR/USD")
+                except Exception as e:
+                    _log("INFO", f"⚠️ Fallback for EUR/USD failed: {e}")
+
 
             # --- DAX from Yahoo Finance ---
             headers = {"User-Agent": "Mozilla/5.0"}
@@ -591,7 +727,88 @@ def save_cache():
     _save_cache()
     return jsonify({"status": "saved", "time": time.time()})
 
+def warmup_fiat_board():
+    """Instantly populate fiat_board_snapshot on startup."""
+    global fiat_board_snapshot, last_fiat_rates
 
+    try:
+        _log("INFO", "⚡ Running startup warm-up for fiat board…")
+
+        usd = http_get_json(f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/USD", timeout=10)
+        eur = http_get_json(f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/EUR", timeout=10)
+
+        usd_rates = usd.get("conversion_rates", {}) or {}
+        eur_rates = eur.get("conversion_rates", {}) or {}
+
+        pairs = {
+            "USD_EUR": usd_rates.get("EUR"),
+            "GBP_USD": (1 / usd_rates["GBP"]) if usd_rates.get("GBP") else None,
+            "USD_JPY": usd_rates.get("JPY"),
+            "USD_CHF": usd_rates.get("CHF"),
+            "AUD_USD": (1 / usd_rates["AUD"]) if usd_rates.get("AUD") else None,
+            "USD_CAD": usd_rates.get("CAD"),
+            "EUR_GBP": eur_rates.get("GBP"),
+        }
+
+        with _cache_lock:
+            pairs_out = {}
+            for k, cur in pairs.items():
+                if cur is None:
+                    continue
+                prev = last_fiat_rates.get(k, cur)
+                pairs_out[k] = {"current": cur, "previous": prev}
+                last_fiat_rates[k] = cur
+            fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
+
+        _log("INFO", f"✅ Fiat board warm-up complete with {len(pairs_out)} pairs.")
+
+    except Exception as e:
+        _log("INFO", f"⚠️ Fiat board warm-up failed: {e}")
+
+
+def warmup_insights():
+    """Instantly populate the insights snapshot on startup."""
+    global insights_snapshot
+
+    try:
+        _log("INFO", "⚡ Running startup warm-up for insights…")
+
+        # BTC & ETH
+        btc_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=8)
+        eth_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=8)
+        btc_usd = float(btc_resp.json().get("price", 0))
+        eth_usd = float(eth_resp.json().get("price", 0))
+
+        # EUR/USD via cached function (avoids 429s)
+        eur_usd = get_exchange_rate_cached("EUR", "USD")
+
+        # DAX (Yahoo)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        dax_resp = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5EGDAXI",
+            params={"interval": "1h"},
+            headers=headers,
+            timeout=8,
+        )
+        dax_json = dax_resp.json()
+        dax_val = (
+            dax_json.get("chart", {}).get("result", [{}])[0]
+            .get("meta", {}).get("regularMarketPrice")
+        )
+
+        with _cache_lock:
+            insights_snapshot = {
+                "btc_usd": btc_usd,
+                "eth_usd": eth_usd,
+                "eur_usd": eur_usd,
+                "dax": dax_val,
+                "timestamp": time.time(),
+            }
+
+        _log("INFO", f"✅ Warm-up complete — BTC={btc_usd}, ETH={eth_usd}, EUR/USD={eur_usd}, DAX={dax_val}")
+
+    except Exception as e:
+        _log("INFO", f"⚠️ Warm-up failed: {e}")
 
 
 # -----
