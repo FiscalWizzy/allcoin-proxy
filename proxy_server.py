@@ -228,12 +228,12 @@ def _candles_loop(interval: str):
 # Background: Fiat board
 # -----------------------
 def _fiat_board_loop():
-    """Background thread: fetch full fiat cross-rates and cache them for conversions + board display."""
+    """Fetch full fiat cross-rates every FIAT_REFRESH seconds and compute rate changes."""
     global fiat_board_snapshot, last_fiat_rates
 
     while True:
         try:
-            # --- Fetch base USD rates from ExchangeRate API ---
+            # --- Fetch all rates once (USD as base) ---
             usd = http_get_json(
                 f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/USD",
                 timeout=10
@@ -255,13 +255,14 @@ def _fiat_board_loop():
                             rate = base_to_usd * usd_to_quote
 
                             prev = last_fiat_rates.get(f"{base}_{quote}")
-                            # detect small change for red/green flicker logic later
-                            if prev is None:
-                                prev = rate
+                            change = 0.0
+                            if prev is not None and prev != 0:
+                                change = ((rate - prev) / prev) * 100
 
                             all_pairs[f"{base}_{quote}"] = {
                                 "current": rate,
-                                "previous": prev,
+                                "previous": prev if prev is not None else rate,
+                                "change": round(change, 4),
                             }
                             last_fiat_rates[f"{base}_{quote}"] = rate
                         except Exception:
@@ -277,8 +278,38 @@ def _fiat_board_loop():
         except Exception as e:
             _log("INFO", f"⚠️ Fiat board update failed: {e}")
 
-        # --- Wait for next refresh cycle ---
+        # Wait until next refresh (default 30 min)
         time.sleep(FIAT_REFRESH)
+
+
+# -----------------------
+# Background: Insights etc.
+# -----------------------
+
+# (Keep your _insights_loop(), candle threads, etc. here — unchanged)
+
+
+# -------------------
+# Thread orchestration
+# -------------------
+def start_threads():
+    """Spawn background threads for candles, backfill, fiat board, and insights."""
+    # Live candle updates (1m, 5m, 1h, 1d)
+    for iv in TRACKED_INTERVALS:
+        t = threading.Thread(target=_candles_loop, args=(iv,), daemon=True)
+        t.start()
+
+    # Historical backfill for each interval
+    for iv in TRACKED_INTERVALS:
+        threading.Thread(target=_backfill_history, args=(iv,), daemon=True).start()
+
+    # Fiat board (no Frankfurter delta anymore)
+    threading.Thread(target=_fiat_board_loop, daemon=True).start()
+
+    # Insights (BTC, ETH, DAX, etc.)
+    threading.Thread(target=_insights_loop, daemon=True).start()
+
+
 
 
 # -----------------------
@@ -516,24 +547,6 @@ def debug_info():
         }
     return jsonify(data)
 
-
-
-# -------------------
-# Thread orchestration
-# -------------------
-def start_threads():
-    # Live updaters
-    for iv in TRACKED_INTERVALS:
-        t = threading.Thread(target=_candles_loop, args=(iv,), daemon=True)
-        t.start()
-
-    # Backfill (run one per interval so it doesn’t block)
-    for iv in TRACKED_INTERVALS:
-        threading.Thread(target=_backfill_history, args=(iv,), daemon=True).start()
-
-    threading.Thread(target=_fiat_board_loop, daemon=True).start()
-    threading.Thread(target=_frankfurter_delta_loop, daemon=True).start()
-    threading.Thread(target=_insights_loop, daemon=True).start()
 
 
 
