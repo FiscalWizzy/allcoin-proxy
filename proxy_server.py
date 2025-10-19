@@ -359,6 +359,16 @@ def _periodic_save():
 
 threading.Thread(target=_periodic_save, daemon=True).start()
 
+def _self_ping():
+    while True:
+        try:
+            requests.get(f"https://allcoin-proxy.onrender.com/health", timeout=5)
+            _log("DEBUG", "🔁 Self-ping OK")
+        except Exception as e:
+            _log("INFO", f"⚠️ Self-ping failed: {e}")
+        time.sleep(600)  # every 10 minutes
+
+threading.Thread(target=_self_ping, daemon=True).start()
 
 
 # -----------------------
