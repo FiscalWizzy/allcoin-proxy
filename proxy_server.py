@@ -425,37 +425,46 @@ def _background_history_cache():
 # Background: Fiat board
 # -----------------------
 def _fiat_board_loop():
-    """Fetch full fiat cross-rates every FIAT_REFRESH seconds using Frankfurter."""
+    """Fetch major fiat pairs every FIAT_REFRESH seconds using Frankfurter (no API key)."""
     global fiat_board_snapshot, last_fiat_rates
+
     while True:
         try:
-            # --- Fetch all rates once (USD base) ---
-            data = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
-            rates = data.get("rates", {}) or {}
+            # --- Pull USD base rates from Frankfurter ---
+            usd_data = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
+            rates = usd_data.get("rates", {}) or {}
 
-            # --- Select interesting or stable pairs (for now, top 10 movers logic can be added later) ---
-            pairs = {}
-            common = ["EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "SEK", "NOK", "MXN"]
-            for cur in common:
-                if cur in rates:
-                    pair = f"USD_{cur}"
-                    pairs[pair] = rates[cur]
+            # --- Build a small board of key global pairs ---
+            pairs = {
+                "USD_EUR": rates.get("EUR"),
+                "GBP_USD": (1 / rates["GBP"]) if rates.get("GBP") else None,
+                "USD_JPY": rates.get("JPY"),
+                "USD_CHF": rates.get("CHF"),
+                "AUD_USD": (1 / rates["AUD"]) if rates.get("AUD") else None,
+                "USD_CAD": rates.get("CAD"),
+                "EUR_GBP": None,  # we’ll fill this separately below
+            }
 
-            # --- Build snapshot with trend info ---
+            # --- Fill EUR→GBP from separate query ---
+            eur_data = http_get_json("https://api.frankfurter.app/latest?from=EUR&to=GBP", timeout=10)
+            pairs["EUR_GBP"] = eur_data.get("rates", {}).get("GBP")
+
+            # --- Update cached board ---
             with _cache_lock:
                 pairs_out = {}
                 for k, cur in pairs.items():
                     prev = last_fiat_rates.get(k)
-                    if prev is None:
-                        pairs_out[k] = {"current": cur, "previous": cur}
-                    else:
-                        pairs_out[k] = {"current": cur, "previous": prev}
+                    pairs_out[k] = {
+                        "current": cur,
+                        "previous": prev if prev is not None else cur,
+                    }
                     last_fiat_rates[k] = cur
                 fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
 
-            _log("INFO", f"✅ Fiat board refreshed ({len(pairs)} pairs)")
+            _log("INFO", "✅ Fiat board refreshed via Frankfurter")
+
         except Exception as e:
-            _log("INFO", f"⚠️ Fiat board update failed: {e}")
+            _log("INFO", f"⚠️ Fiat board warm-up failed: {e}")
 
         time.sleep(FIAT_REFRESH)
 
