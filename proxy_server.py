@@ -593,43 +593,43 @@ threading.Thread(target=_self_ping, daemon=True).start()
 
 
 # -----------------------
-# Cached exchange-rate helper
+# Cached exchange-rate helper (Frankfurter-based, no API key)
 # -----------------------
 _exchange_cache = {}
 _exchange_cache_ttl = 3600  # 1 hour
 
 def get_exchange_rate_cached(base: str, quote: str) -> float | None:
-    """Return cached EUR/USD etc. to avoid quota exhaustion."""
+    """Fetch exchange rates from Frankfurter once per hour and reuse."""
     key = f"{base}_{quote}"
     now = time.time()
 
-    # Re-use if still fresh
+    # Serve from cache if still fresh
     if key in _exchange_cache:
         rate, ts = _exchange_cache[key]
         if now - ts < _exchange_cache_ttl:
             return rate
 
-    # Otherwise fetch once and cache
     try:
-        url = f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/pair/{base}/{quote}"
-        data = http_get_json(url, timeout=10)
-        rate = data.get("conversion_rate")
+        resp = requests.get(
+            f"https://api.frankfurter.app/latest?from={base}&to={quote}",
+            timeout=10
+        )
+        data = resp.json()
+        rate = data["rates"].get(quote)
         if rate:
             _exchange_cache[key] = (rate, now)
             return rate
     except Exception as e:
-        _log("INFO", f"⚠️ get_exchange_rate_cached failed: {e}")
+        print(f"⚠️ get_exchange_rate_cached failed: {e}")
+
     return None
 
 
-# -----------------------
-# Background: Insights
-# -----------------------
+
 def _insights_loop():
     """Fetch BTC, ETH, EUR/USD, and DAX; auto-backoff on errors."""
     global insights_snapshot
     cooldown = 0
-
     while True:
         try:
             if cooldown > 0:
@@ -643,13 +643,8 @@ def _insights_loop():
             btc_usd = float(btc_resp.json()["price"])
             eth_usd = float(eth_resp.json()["price"])
 
-            # --- EUR/USD (Frankfurter only; no key, no limits) ---
-            try:
-                fx = http_get_json("https://api.frankfurter.app/latest?from=EUR&to=USD", timeout=8)
-                eur_usd = fx.get("rates", {}).get("USD")
-            except Exception as e:
-                _log("INFO", f"⚠️ EUR/USD fetch from Frankfurter failed: {e}")
-                eur_usd = None
+            # --- EUR/USD via Frankfurter (cached hourly) ---
+            eur_usd = get_exchange_rate_cached("EUR", "USD")
 
             # --- DAX from Yahoo Finance ---
             headers = {"User-Agent": "Mozilla/5.0"}
@@ -672,15 +667,17 @@ def _insights_loop():
                 "dax": dax_val,
                 "timestamp": time.time(),
             }
+
             with _cache_lock:
                 insights_snapshot = snap
             _log("INFO", f"✅ Insights updated: {snap}")
 
         except Exception as e:
             _log("INFO", f"⚠️ Insights update failed: {e}")
-            cooldown = 60  # backoff after failure
+            cooldown = 60  # wait a bit if error
 
         time.sleep(INSIGHTS_REFRESH)
+
 
 
 # -----------
