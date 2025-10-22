@@ -593,6 +593,36 @@ threading.Thread(target=_self_ping, daemon=True).start()
 
 
 # -----------------------
+# Cached exchange-rate helper
+# -----------------------
+_exchange_cache = {}
+_exchange_cache_ttl = 3600  # 1 hour
+
+def get_exchange_rate_cached(base: str, quote: str) -> float | None:
+    """Return cached EUR/USD etc. to avoid quota exhaustion."""
+    key = f"{base}_{quote}"
+    now = time.time()
+
+    # Re-use if still fresh
+    if key in _exchange_cache:
+        rate, ts = _exchange_cache[key]
+        if now - ts < _exchange_cache_ttl:
+            return rate
+
+    # Otherwise fetch once and cache
+    try:
+        url = f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/pair/{base}/{quote}"
+        data = http_get_json(url, timeout=10)
+        rate = data.get("conversion_rate")
+        if rate:
+            _exchange_cache[key] = (rate, now)
+            return rate
+    except Exception as e:
+        _log("INFO", f"⚠️ get_exchange_rate_cached failed: {e}")
+    return None
+
+
+# -----------------------
 # Background: Insights
 # -----------------------
 def _insights_loop():
