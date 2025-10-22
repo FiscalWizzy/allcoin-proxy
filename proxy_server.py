@@ -120,6 +120,32 @@ def http_get_json(url: str, timeout: float = 10.0, params: Optional[dict] = None
     resp.raise_for_status()
     return resp.json()
 
+def get_exchange_rate_cached(base: str, quote: str) -> float | None:
+    """Fetch exchange rates from Frankfurter once per hour and reuse."""
+    key = f"{base}_{quote}"
+    now = time.time()
+
+    # Serve from cache if still fresh
+    if key in _exchange_cache:
+        rate, ts = _exchange_cache[key]
+        if now - ts < _exchange_cache_ttl:
+            return rate
+
+    try:
+        resp = requests.get(
+            f"https://api.frankfurter.app/latest?from={base}&to={quote}",
+            timeout=10
+        )
+        data = resp.json()
+        rate = data["rates"].get(quote)
+        if rate:
+            _exchange_cache[key] = (rate, now)
+            return rate
+    except Exception as e:
+        print(f"⚠️ get_exchange_rate_cached failed: {e}")
+
+    return None
+
 
 # -------------
 # In-memory cache
@@ -399,25 +425,23 @@ def _background_history_cache():
 # Background: Fiat board
 # -----------------------
 def _fiat_board_loop():
-    """Fetch full fiat cross-rates every FIAT_REFRESH seconds and compute rate changes."""
+    """Fetch full fiat cross-rates every FIAT_REFRESH seconds using Frankfurter."""
     global fiat_board_snapshot, last_fiat_rates
-
     while True:
         try:
-            # --- Fetch all rates once (USD as base) ---
-            usd = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
-            usd_rates = usd.get("rates", {}) or {}
+            # --- Fetch all rates once (USD base) ---
+            data = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
+            rates = data.get("rates", {}) or {}
 
-            # Example pairs to watch (you can expand this list)
-            tracked = ["EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "CNY", "NZD", "SEK", "NOK"]
-
+            # --- Select interesting or stable pairs (for now, top 10 movers logic can be added later) ---
             pairs = {}
-            for to in tracked:
-                if to in usd_rates:
-                    pairs[f"USD_{to}"] = usd_rates[to]
-                    pairs[f"{to}_USD"] = 1 / usd_rates[to] if usd_rates[to] else None
+            common = ["EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "SEK", "NOK", "MXN"]
+            for cur in common:
+                if cur in rates:
+                    pair = f"USD_{cur}"
+                    pairs[pair] = rates[cur]
 
-            # Compute deltas and trend colors
+            # --- Build snapshot with trend info ---
             with _cache_lock:
                 pairs_out = {}
                 for k, cur in pairs.items():
@@ -427,24 +451,14 @@ def _fiat_board_loop():
                     else:
                         pairs_out[k] = {"current": cur, "previous": prev}
                     last_fiat_rates[k] = cur
+                fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
 
-                # Build snapshot (sorted by % change)
-                movers = sorted(
-                    pairs_out.items(),
-                    key=lambda kv: abs((kv[1]["current"] - kv[1]["previous"]) / kv[1]["previous"])
-                    if kv[1]["previous"] else 0,
-                    reverse=True,
-                )
-
-                top10 = dict(movers[:10])  # top movers only
-                fiat_board_snapshot = {"pairs": top10, "timestamp": time.time()}
-
-            _log("INFO", f"✅ Fiat board refreshed ({len(top10)} pairs)")
-
+            _log("INFO", f"✅ Fiat board refreshed ({len(pairs)} pairs)")
         except Exception as e:
             _log("INFO", f"⚠️ Fiat board update failed: {e}")
 
         time.sleep(FIAT_REFRESH)
+
 
 
 
@@ -597,32 +611,6 @@ threading.Thread(target=_self_ping, daemon=True).start()
 # -----------------------
 _exchange_cache = {}
 _exchange_cache_ttl = 3600  # 1 hour
-
-def get_exchange_rate_cached(base: str, quote: str) -> float | None:
-    """Fetch exchange rates from Frankfurter once per hour and reuse."""
-    key = f"{base}_{quote}"
-    now = time.time()
-
-    # Serve from cache if still fresh
-    if key in _exchange_cache:
-        rate, ts = _exchange_cache[key]
-        if now - ts < _exchange_cache_ttl:
-            return rate
-
-    try:
-        resp = requests.get(
-            f"https://api.frankfurter.app/latest?from={base}&to={quote}",
-            timeout=10
-        )
-        data = resp.json()
-        rate = data["rates"].get(quote)
-        if rate:
-            _exchange_cache[key] = (rate, now)
-            return rate
-    except Exception as e:
-        print(f"⚠️ get_exchange_rate_cached failed: {e}")
-
-    return None
 
 
 
