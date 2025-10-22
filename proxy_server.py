@@ -12,7 +12,6 @@ from flask import Flask, request, jsonify
 # -----------------------
 # Config (env-overridable)
 # -----------------------
-EXCHANGE_RATE_API_KEY = os.environ.get("EXCHANGE_RATE_API_KEY", "e351e54a567119afe9bb037d")
 EXCHANGE_RATE_API_URL = os.environ.get("EXCHANGE_RATE_API_URL", "https://api.frankfurter.app")
 BINANCE_API = os.environ.get("BINANCE_API", "https://api.binance.com")
 COINGECKO_API = os.environ.get("COINGECKO_API", "https://api.coingecko.com/api/v3")
@@ -799,43 +798,6 @@ def save_cache():
     _save_cache()
     return jsonify({"status": "saved", "time": time.time()})
 
-def warmup_fiat_board():
-    """Instantly populate fiat_board_snapshot on startup."""
-    global fiat_board_snapshot, last_fiat_rates
-
-    try:
-        _log("INFO", "⚡ Running startup warm-up for fiat board…")
-
-        usd = http_get_json(f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/USD", timeout=10)
-        eur = http_get_json(f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/EUR", timeout=10)
-
-        usd_rates = usd.get("conversion_rates", {}) or {}
-        eur_rates = eur.get("conversion_rates", {}) or {}
-
-        pairs = {
-            "USD_EUR": usd_rates.get("EUR"),
-            "GBP_USD": (1 / usd_rates["GBP"]) if usd_rates.get("GBP") else None,
-            "USD_JPY": usd_rates.get("JPY"),
-            "USD_CHF": usd_rates.get("CHF"),
-            "AUD_USD": (1 / usd_rates["AUD"]) if usd_rates.get("AUD") else None,
-            "USD_CAD": usd_rates.get("CAD"),
-            "EUR_GBP": eur_rates.get("GBP"),
-        }
-
-        with _cache_lock:
-            pairs_out = {}
-            for k, cur in pairs.items():
-                if cur is None:
-                    continue
-                prev = last_fiat_rates.get(k, cur)
-                pairs_out[k] = {"current": cur, "previous": prev}
-                last_fiat_rates[k] = cur
-            fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
-
-        _log("INFO", f"✅ Fiat board warm-up complete with {len(pairs_out)} pairs.")
-
-    except Exception as e:
-        _log("INFO", f"⚠️ Fiat board warm-up failed: {e}")
 
 
 def warmup_insights():
