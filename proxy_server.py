@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify
 # Config (env-overridable)
 # -----------------------
 EXCHANGE_RATE_API_KEY = os.environ.get("EXCHANGE_RATE_API_KEY", "e351e54a567119afe9bb037d")
-EXCHANGE_RATE_API_URL = os.environ.get("EXCHANGE_RATE_API_URL", "https://v6.exchangerate-api.com/v6")
+EXCHANGE_RATE_API_URL = os.environ.get("EXCHANGE_RATE_API_URL", "https://api.frankfurter.app")
 BINANCE_API = os.environ.get("BINANCE_API", "https://api.binance.com")
 COINGECKO_API = os.environ.get("COINGECKO_API", "https://api.coingecko.com/api/v3")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -346,6 +346,55 @@ def _candles_loop(interval: str):
         _log("INFO", f"⏱️ {interval} batch took {took:.1f}s; sleeping {sleep_for:.1f}s")
         time.sleep(sleep_for)
 
+def _background_history_cache():
+    """
+    Keep a small rolling cache (e.g. last 300–600 candles) per tracked pair & interval.
+    Works quietly in the background and never triggers rate-limit spikes.
+    """
+    max_keep = 600        # keep ~600 candles in memory
+    fetch_batch = 200     # fetch this many per update
+    sleep_between_pairs = 4.0  # seconds between symbols (to avoid 429s)
+
+    while True:
+        for interval in TRACKED_INTERVALS:
+            for sym in TRACKED_SYMBOLS:
+                try:
+                    key = (sym, interval)
+                    with _cache_lock:
+                        cur = candle_cache.get(key, [])
+                        have = len(cur)
+                        latest_ts = cur[-1][0] * 1000 if cur else None
+
+                    # If we have fewer than half the desired cache, top it up
+                    if have < max_keep // 2:
+                        params = {"symbol": sym, "interval": interval, "limit": fetch_batch}
+                        if latest_ts:
+                            params["endTime"] = int(latest_ts)
+                        raw = http_get_json(f"{BINANCE_API}/api/v3/klines", timeout=10, params=params)
+                        rows = _normalize_klines(raw)
+                        if not rows:
+                            continue
+
+                        # Merge safely
+                        _bounded_extend(key, rows)
+
+                        # Cap memory
+                        with _cache_lock:
+                            candle_cache[key] = candle_cache[key][-max_keep:]
+
+                        _log("INFO", f"🕓 Cached {len(rows)} new candles for {sym} {interval} (cache={len(candle_cache[key])})")
+
+                    time.sleep(sleep_between_pairs)
+
+                except Exception as e:
+                    _log("INFO", f"⚠️ Cache refill failed {sym} {interval}: {e}")
+                    time.sleep(2)
+
+        # Whole cycle done — rest before starting again
+        _log("INFO", "💤 History cache cycle complete — sleeping 10m")
+        time.sleep(600)  # run every 10 minutes
+
+
 # -----------------------
 # Background: Fiat board
 # -----------------------
@@ -356,52 +405,47 @@ def _fiat_board_loop():
     while True:
         try:
             # --- Fetch all rates once (USD as base) ---
-            usd = http_get_json(
-                f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/USD",
-                timeout=10
-            )
-            usd_rates = usd.get("conversion_rates", {}) or {}
+            usd = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
+            usd_rates = usd.get("rates", {}) or {}
 
-            # --- Build full cross-rate table dynamically ---
+            # Example pairs to watch (you can expand this list)
+            tracked = ["EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "CNY", "NZD", "SEK", "NOK"]
+
+            pairs = {}
+            for to in tracked:
+                if to in usd_rates:
+                    pairs[f"USD_{to}"] = usd_rates[to]
+                    pairs[f"{to}_USD"] = 1 / usd_rates[to] if usd_rates[to] else None
+
+            # Compute deltas and trend colors
             with _cache_lock:
-                all_pairs = {}
-                currencies = list(usd_rates.keys())
+                pairs_out = {}
+                for k, cur in pairs.items():
+                    prev = last_fiat_rates.get(k)
+                    if prev is None:
+                        pairs_out[k] = {"current": cur, "previous": cur}
+                    else:
+                        pairs_out[k] = {"current": cur, "previous": prev}
+                    last_fiat_rates[k] = cur
 
-                for base in currencies:
-                    for quote in currencies:
-                        if base == quote:
-                            continue
-                        try:
-                            base_to_usd = 1 / usd_rates[base] if base != "USD" else 1.0
-                            usd_to_quote = usd_rates[quote]
-                            rate = base_to_usd * usd_to_quote
+                # Build snapshot (sorted by % change)
+                movers = sorted(
+                    pairs_out.items(),
+                    key=lambda kv: abs((kv[1]["current"] - kv[1]["previous"]) / kv[1]["previous"])
+                    if kv[1]["previous"] else 0,
+                    reverse=True,
+                )
 
-                            prev = last_fiat_rates.get(f"{base}_{quote}")
-                            change = 0.0
-                            if prev is not None and prev != 0:
-                                change = ((rate - prev) / prev) * 100
+                top10 = dict(movers[:10])  # top movers only
+                fiat_board_snapshot = {"pairs": top10, "timestamp": time.time()}
 
-                            all_pairs[f"{base}_{quote}"] = {
-                                "current": rate,
-                                "previous": prev if prev is not None else rate,
-                                "change": round(change, 4),
-                            }
-                            last_fiat_rates[f"{base}_{quote}"] = rate
-                        except Exception:
-                            continue
-
-                fiat_board_snapshot = {
-                    "pairs": all_pairs,
-                    "timestamp": time.time(),
-                }
-
-            _log("INFO", f"✅ Fiat board refreshed with {len(all_pairs)} pairs")
+            _log("INFO", f"✅ Fiat board refreshed ({len(top10)} pairs)")
 
         except Exception as e:
             _log("INFO", f"⚠️ Fiat board update failed: {e}")
 
-        # Wait until next refresh (default 30 min)
         time.sleep(FIAT_REFRESH)
+
 
 
 # -----------------------
@@ -472,11 +516,12 @@ def warmup_fiat_board():
         try:
             _log("INFO", "⚡ Running startup warm-up for fiat board…")
 
-            usd = http_get_json(f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/USD", timeout=10)
-            eur = http_get_json(f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/latest/EUR", timeout=10)
+            usd = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=USD", timeout=10)
+            eur = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=EUR", timeout=10)
 
-            usd_rates = usd.get("conversion_rates", {}) or {}
-            eur_rates = eur.get("conversion_rates", {}) or {}
+            usd_rates = usd.get("rates", {}) or {}
+            eur_rates = eur.get("rates", {}) or {}
+
 
             pairs = {
                 "USD_EUR": usd_rates.get("EUR"),
@@ -554,6 +599,7 @@ def _insights_loop():
     """Fetch BTC, ETH, EUR/USD, and DAX; auto-backoff on errors."""
     global insights_snapshot
     cooldown = 0
+
     while True:
         try:
             if cooldown > 0:
@@ -567,18 +613,13 @@ def _insights_loop():
             btc_usd = float(btc_resp.json()["price"])
             eth_usd = float(eth_resp.json()["price"])
 
-            # --- EUR/USD (cached to avoid 429s) ---
-            eur_usd = get_exchange_rate_cached("EUR", "USD")
-
-            # Optional fallback if ExchangeRate API is still down
-            if eur_usd is None:
-                try:
-                    fb = http_get_json("https://api.frankfurter.app/latest?from=EUR&to=USD", timeout=8)
-                    eur_usd = fb["rates"]["USD"]
-                    _log("INFO", "🌍 Used Frankfurter fallback for EUR/USD")
-                except Exception as e:
-                    _log("INFO", f"⚠️ Fallback for EUR/USD failed: {e}")
-
+            # --- EUR/USD (Frankfurter only; no key, no limits) ---
+            try:
+                fx = http_get_json("https://api.frankfurter.app/latest?from=EUR&to=USD", timeout=8)
+                eur_usd = fx.get("rates", {}).get("USD")
+            except Exception as e:
+                _log("INFO", f"⚠️ EUR/USD fetch from Frankfurter failed: {e}")
+                eur_usd = None
 
             # --- DAX from Yahoo Finance ---
             headers = {"User-Agent": "Mozilla/5.0"}
@@ -597,7 +638,7 @@ def _insights_loop():
             snap = {
                 "btc_usd": btc_usd,
                 "eth_usd": eth_usd,
-                "eur_usd": fx.get("conversion_rate"),
+                "eur_usd": eur_usd,
                 "dax": dax_val,
                 "timestamp": time.time(),
             }
@@ -607,7 +648,7 @@ def _insights_loop():
 
         except Exception as e:
             _log("INFO", f"⚠️ Insights update failed: {e}")
-            cooldown = 60  # wait a bit if error
+            cooldown = 60  # backoff after failure
 
         time.sleep(INSIGHTS_REFRESH)
 
@@ -637,27 +678,34 @@ def insights():
 
 @app.route("/crypto-chart")
 def crypto_chart():
+    """
+    Serve cached candles only — always instant and rate-limit safe.
+    The background cache thread keeps it filled automatically.
+    """
     symbol = request.args.get("symbol", "BTCUSDT").upper()
     interval = request.args.get("interval", "1m")
-    end_time = request.args.get("endTime")   # optional ms
     limit = int(request.args.get("limit", str(RETURN_CANDLES)))
-
-    end_ts = None
+    
+    end_time = request.args.get("endTime")
     if end_time:
         try:
-            end_ts = float(end_time) / 1000.0
+            end_time = int(end_time)
         except Exception:
-            end_ts = None
+            end_time = None
+
+    end_ts = float(end_time) / 1000.0 if end_time else None
 
     key = (symbol, interval)
     rows = _get_cached_slice(key, end_ts=end_ts, limit=limit)
 
-    # STRICT cache behavior: if not in cache, just say so quickly (no slow fetch)
+    # ⚠️ Strict cache-only: don't call Binance from here anymore
     if not rows:
+        _log("INFO", f"⚠️ No cached data for {symbol} {interval}")
         return jsonify({"error": "no cached data yet"}), 503
 
     out = [[int(r[0] * 1000), r[1], r[2], r[3], r[4]] for r in rows]
     return jsonify({"candles": out})
+
 
 
 
