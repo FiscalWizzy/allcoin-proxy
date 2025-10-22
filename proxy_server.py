@@ -24,29 +24,6 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")  # "DEBUG" to be chatty
 EXCHANGE_CACHE = {}
 EXCHANGE_TTL = 1800  # cache for 30 minutes
 
-def get_exchange_rate_cached(base: str, quote: str):
-    """Return cached EUR/USD etc., refreshing from ExchangeRate API if needed."""
-    pair = f"{base}_{quote}"
-    now = time.time()
-
-    # ✅ Use cached value if still fresh
-    if pair in EXCHANGE_CACHE and now - EXCHANGE_CACHE[pair]["time"] < EXCHANGE_TTL:
-        return EXCHANGE_CACHE[pair]["value"]
-
-    try:
-        url = f"{EXCHANGE_RATE_API_URL}/{EXCHANGE_RATE_API_KEY}/pair/{base}/{quote}"
-        data = http_get_json(url, timeout=10)
-        val = data.get("conversion_rate")
-        if val is not None:
-            EXCHANGE_CACHE[pair] = {"value": val, "time": now}
-            _log("INFO", f"💾 Cached {pair}: {val}")
-            return val
-    except Exception as e:
-        _log("INFO", f"⚠️ Cached rate fetch failed for {pair}: {e}")
-
-    # fallback to previous cached value if exists
-    return EXCHANGE_CACHE.get(pair, {}).get("value", None)
-
 
 # Adaptive refresh cadence (seconds)
 CADENCE = {
