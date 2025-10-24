@@ -9,7 +9,6 @@ from typing import Dict, Tuple, List, Optional
 import requests
 from flask import Flask, request, jsonify
 
-print("🚨 DEBUG: running the FRANKFURTER version 🚨", flush=True)
 
 
 # -----------------------
@@ -17,7 +16,6 @@ print("🚨 DEBUG: running the FRANKFURTER version 🚨", flush=True)
 # -----------------------
 EXCHANGE_RATE_API_URL = os.environ.get("EXCHANGE_RATE_API_URL", "https://api.frankfurter.app")
 BINANCE_API = os.environ.get("BINANCE_API", "https://api.binance.com")
-COINGECKO_API = os.environ.get("COINGECKO_API", "https://api.coingecko.com/api/v3")
 PORT = int(os.environ.get("PORT", "8080"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")  # "DEBUG" to be chatty
 
@@ -44,6 +42,7 @@ TRACKED_SYMBOLS = [
 ]
 TRACKED_INTERVALS = ["1m", "5m", "1h", "1d"]
 
+
 # Candles memory bounds
 MAX_CANDLES_PER_KEY = 5000
 RETURN_CANDLES = 200
@@ -69,6 +68,8 @@ FIAT_FILE = os.path.join(DATA_DIR, "fiat.json")
 INSIGHTS_FILE = os.path.join(DATA_DIR, "insights.json")
 
 _backfill_done = {iv: False for iv in TRACKED_INTERVALS}
+
+all_fiat_rates: dict = {}
 
 
 # -------------
@@ -403,51 +404,55 @@ def _background_history_cache():
 # -----------------------
 # Background: Fiat board
 # -----------------------
+
 def _fiat_board_loop():
-    """Fetch major fiat pairs every FIAT_REFRESH seconds using Frankfurter (no API key)."""
-    global fiat_board_snapshot, last_fiat_rates
+    """Fetch and cache all fiat rates from Frankfurter; keep top-10 movers for the UI."""
+    global all_fiat_rates, fiat_board_snapshot, last_fiat_rates
 
     while True:
         try:
-            # --- Pull USD base rates from Frankfurter ---
+            # --- Fetch complete USD base rates ---
             usd_data = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
             rates = usd_data.get("rates", {}) or {}
 
-            # --- Build a small board of key global pairs ---
-            pairs = {
-                "USD_EUR": rates.get("EUR"),
-                "GBP_USD": (1 / rates["GBP"]) if rates.get("GBP") else None,
-                "USD_JPY": rates.get("JPY"),
-                "USD_CHF": rates.get("CHF"),
-                "AUD_USD": (1 / rates["AUD"]) if rates.get("AUD") else None,
-                "USD_CAD": rates.get("CAD"),
-                "EUR_GBP": None,  # we’ll fill this separately below
-            }
+            if not rates:
+                raise ValueError("Empty data from Frankfurter")
 
-            # --- Fill EUR→GBP from separate query ---
-            eur_data = http_get_json("https://api.frankfurter.app/latest?from=EUR&to=GBP", timeout=10)
-            pairs["EUR_GBP"] = eur_data.get("rates", {}).get("GBP")
-
-            # --- Update cached board ---
+            # ✅ Store entire rate map for use by /convert
             with _cache_lock:
-                pairs_out = {}
-                for k, cur in pairs.items():
-                    prev = last_fiat_rates.get(k)
-                    pairs_out[k] = {
-                        "current": cur,
-                        "previous": prev if prev is not None else cur,
-                    }
-                    last_fiat_rates[k] = cur
+                all_fiat_rates = rates.copy()
+
+            # --- Compute % deltas for top-movers display ---
+            deltas = {}
+            for cur, val in rates.items():
+                prev = last_fiat_rates.get(cur)
+                if prev and prev != 0:
+                    deltas[cur] = abs((val - prev) / prev)
+                else:
+                    deltas[cur] = 0.0
+
+            top10 = sorted(deltas, key=deltas.get, reverse=True)[:10]
+
+            pairs_out = {}
+            for cur in top10:
+                prev = last_fiat_rates.get(cur, rates[cur])
+                pairs_out[f"USD_{cur}"] = {
+                    "current": rates[cur],
+                    "previous": prev,
+                    "change_pct": ((rates[cur] - prev) / prev * 100) if prev else 0.0,
+                }
+                last_fiat_rates[cur] = rates[cur]
+
+            # ✅ Update fiat board snapshot for UI
+            with _cache_lock:
                 fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
 
-            _log("INFO", "✅ Fiat board refreshed via Frankfurter")
+            _log("INFO", f"✅ Cached {len(all_fiat_rates)} total rates; board shows top-10 movers: {list(pairs_out.keys())}")
 
         except Exception as e:
-            _log("INFO", f"⚠️ Fiat board warm-up failed: {e}")
+            _log("INFO", f"⚠️ Fiat board update failed: {e}")
 
         time.sleep(FIAT_REFRESH)
-
-
 
 
 # -----------------------
@@ -716,38 +721,44 @@ def crypto_chart():
 
 @app.route("/convert")
 def convert():
-    """Convert fiat currencies using the full cached rate set."""
+    """Convert any fiat currencies using the fully cached rate set."""
     from_cur = request.args.get("from", "").upper()
     to_cur = request.args.get("to", "").upper()
     amount = request.args.get("amount", type=float, default=1.0)
 
     with _cache_lock:
-        pairs = fiat_board_snapshot.get("pairs", {}) if fiat_board_snapshot else {}
+        rates = all_fiat_rates.copy() if all_fiat_rates else {}
 
-    if not pairs:
+    if not rates:
         return jsonify({"error": "no cached fiat data yet"}), 503
 
-    # Build a lookup of all currencies relative to USD
-    usd_rates = {"USD": 1.0}
-    for k, v in pairs.items():
-        if k.startswith("USD_"):
-            code = k.split("_", 1)[1]
-            usd_rates[code] = v.get("current")
+    if from_cur == to_cur:
+        return jsonify({"from": from_cur, "to": to_cur, "amount": amount, "converted": amount})
 
-    if from_cur not in usd_rates or to_cur not in usd_rates:
-        return jsonify({"error": f"unsupported or missing pair {from_cur}/{to_cur}"}), 400
+    # Reconstruct rates relative to USD
+    if from_cur == "USD":
+        base_to_usd = 1.0
+    elif from_cur in rates:
+        base_to_usd = 1 / rates[from_cur]
+    else:
+        return jsonify({"error": f"unsupported base currency {from_cur}"}), 400
 
-    try:
-        amount_in_usd = amount / usd_rates[from_cur]
-        converted = amount_in_usd * usd_rates[to_cur]
-        return jsonify({
-            "from": from_cur,
-            "to": to_cur,
-            "amount": amount,
-            "converted": round(converted, 6)
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    if to_cur == "USD":
+        usd_to_target = 1.0
+    elif to_cur in rates:
+        usd_to_target = rates[to_cur]
+    else:
+        return jsonify({"error": f"unsupported target currency {to_cur}"}), 400
+
+    converted = amount * base_to_usd * usd_to_target
+    return jsonify({
+        "from": from_cur,
+        "to": to_cur,
+        "amount": amount,
+        "converted": round(converted, 6),
+        "timestamp": time.time()
+    })
+
 
 
 
@@ -774,6 +785,61 @@ def debug_info():
             "timestamp": time.time(),
         }
     return jsonify(data)
+
+@app.route("/refresh-fiat")
+def refresh_fiat():
+    """Manually trigger a one-time fiat board and full cache refresh."""
+    global all_fiat_rates, fiat_board_snapshot, last_fiat_rates
+    try:
+        _log("INFO", "🔄 Manual fiat refresh triggered…")
+
+        usd_data = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
+        rates = usd_data.get("rates", {}) or {}
+
+        if not rates:
+            return jsonify({"error": "No data returned from Frankfurter"}), 503
+
+        # ✅ Update full cache
+        with _cache_lock:
+            all_fiat_rates = rates.copy()
+
+        # Compute movement deltas
+        deltas = {}
+        for cur, val in rates.items():
+            prev = last_fiat_rates.get(cur)
+            if prev and prev != 0:
+                deltas[cur] = abs((val - prev) / prev)
+            else:
+                deltas[cur] = 0.0
+
+        # Pick top 10 movers
+        top10 = sorted(deltas, key=deltas.get, reverse=True)[:10]
+        pairs_out = {}
+        for cur in top10:
+            prev = last_fiat_rates.get(cur, rates[cur])
+            pairs_out[f"USD_{cur}"] = {
+                "current": rates[cur],
+                "previous": prev,
+                "change_pct": ((rates[cur] - prev) / prev * 100) if prev else 0.0,
+            }
+            last_fiat_rates[cur] = rates[cur]
+
+        with _cache_lock:
+            fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
+
+        _log("INFO", f"✅ Manual fiat refresh complete: {len(all_fiat_rates)} total cached; board shows top-10 movers.")
+
+        return jsonify({
+            "message": "Manual fiat refresh complete",
+            "total_rates": len(all_fiat_rates),
+            "top_movers": list(pairs_out.keys()),
+            "timestamp": time.time()
+        })
+
+    except Exception as e:
+        _log("INFO", f"⚠️ Manual fiat refresh failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/save-cache")
 def save_cache():
