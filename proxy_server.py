@@ -517,6 +517,8 @@ def warmup_fiat_board():
     while True:
         try:
             _log("INFO", "⚡ Running startup warm-up for fiat board…")
+            print(f"🌍 DEBUG: EXCHANGE_RATE_API_URL = {EXCHANGE_RATE_API_URL}", flush=True)
+
 
             usd = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=USD", timeout=10)
             eur = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=EUR", timeout=10)
