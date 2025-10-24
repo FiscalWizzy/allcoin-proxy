@@ -9,6 +9,9 @@ from typing import Dict, Tuple, List, Optional
 import requests
 from flask import Flask, request, jsonify
 
+print("🚨 DEBUG: running the FRANKFURTER version 🚨", flush=True)
+
+
 # -----------------------
 # Config (env-overridable)
 # -----------------------
