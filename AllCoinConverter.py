@@ -38,11 +38,28 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QGroupBox,
-    QGridLayout
+    QGridLayout,
+    QHeaderView
 )
+
+ICON_MAP = {
+    "BTC/USD": "₿",
+    "ETH/USD": "Ξ",
+    "EUR/USD": "€/$",
+    "DAX": "📊",
+    "S&P 500": "📈",
+    "FTSE 100": "🇬🇧",
+    "Apple": "",
+    "Nvidia": "🟩",
+    "Crude Oil": "🛢️",
+    "Gold": "🥇",
+    "Microsoft": "🪟", 
+    "BlackRock": "🏦", 
+}
 
 
 API_KEY = 'e351e54a567119afe9bb037d'
+BASE_URL = "https://allcoin-proxy.onrender.com"
 
 symbol_to_id = {}
 fiat_list = []
@@ -146,42 +163,35 @@ class SearchableComboBox(QComboBox):
 
 def format_amount_input(text):
     try:
-        # Keep '.' (decimal), remove ',' (thousands)
         clean = text.replace(",", "")
         if clean:
-            # Format with thousands separators but preserve decimals
             if "." in clean:
                 whole, frac = clean.split(".", 1)
-                if whole:
-                    whole_int = int(whole)
-                    formatted = f"{whole_int:,}.{frac}"
-                else:
-                    formatted = f"0.{frac}"
+                formatted = f"{int(whole or 0):,}.{frac}"
             else:
                 formatted = f"{int(clean):,}"
 
-            amount_input.blockSignals(True)
-            amount_input.setText(formatted)
-            amount_input.blockSignals(False)
-            # leave cursor at end (simplest reliable behavior)
-            amount_input.setCursorPosition(len(formatted))
+            amount_input_fiat.blockSignals(True)
+            amount_input_fiat.setText(formatted)
+            amount_input_fiat.blockSignals(False)
+            amount_input_fiat.setCursorPosition(len(formatted))
     except ValueError:
         pass
 
 
-
 def populate_currency_dropdowns():
     global fiat_list
-    url = f"https://v6.exchangerate-api.com/v6/{API_KEY}/codes"
     try:
-        response = requests.get(url)
-        data = response.json()
-        if data["result"] == "success":
-            fiat_list = sorted([f"{name} ({code})" for code, name in data["supported_codes"]])
-        else:
-            result_label.setText("Failed to load fiat currencies:")
+        resp = requests.get("https://api.frankfurter.app/currencies", timeout=30)
+        data = resp.json()
+        fiat_list = sorted([f"{name} ({code})" for code, name in data.items()])
     except Exception as e:
-        result_label.setText(f"Error loading currencies: {e}")
+        print(f"⚠️ Error loading fiat currencies: {e}")
+        fiat_list = []
+
+    from_currency_fiat.addItems(fiat_list)
+    to_currency_fiat.addItems(fiat_list)
+
 
 def fetch_supported_fiats_from_coingecko():
     global coingecko_supported_fiats
@@ -296,6 +306,10 @@ app.setStyleSheet("""
     }
 
 """)
+
+# --- Global headline style (reusable for all section titles) ---
+GOLD_HEADER_STYLE = "font-weight: bold; font-size: 16px; color: #FFD700;"
+
 
 # Result Display
 result_label = QLabel("")
@@ -516,6 +530,8 @@ def convert_currency():
     to_cur_full = to_currency.currentText()
     from_cur = extract_symbol(from_cur_full)
     to_cur = extract_symbol(to_cur_full)
+    print(f"[DEBUG] from_cur_full='{from_cur_full}' → {from_cur}, to_cur_full='{to_cur_full}' → {to_cur}")
+
 
     try:
         amount = float(amount_text.replace(",", ""))
@@ -524,7 +540,7 @@ def convert_currency():
         return
 
     if mode == "fiat":
-        url = f"https://allcoin-proxy-154235898849.europe-west1.run.app/convert?from={from_cur}&to={to_cur}&amount={amount}"
+        url = f"{BASE_URL}/convert?from={from_cur}&to={to_cur}&amount={amount}"
         try:
             response = requests.get(url)
             data = response.json()
@@ -543,8 +559,8 @@ def convert_currency():
             if quote == "USD":
                 quote = "USDT"
             pair = f"{base}{quote}"
-            url = "https://allcoin-proxy-154235898849.europe-west1.run.app/crypto-price"
-            resp = requests.get(url, timeout=10)
+            url = f"{BASE_URL}/crypto-price"
+            resp = requests.get(url, timeout=8)
             prices = resp.json()
             if pair not in prices:
                 result_label.setText(f"No price available for {pair}")
@@ -734,20 +750,40 @@ def _on_pair_changed(_):
 chart_pair_box.currentTextChanged.connect(_on_pair_changed)
 
 def refresh_candles_async():
-    """Fetch candles in background and update the chart safely."""
+    """Fetch candles in background and update the chart safely via the proxy server."""
     pair = chart_pair_box.currentText().replace("/", "").upper()
     interval = selected_interval    
 
     def _fetch_and_emit():
         try:
-            url = f"https://allcoin-proxy-154235898849.europe-west1.run.app/crypto-chart?symbol={pair}&interval={interval}"
-            resp = requests.get(url, timeout=10)
+            # ✅ Always call your proxy server, not Binance directly
+            url = f"{BASE_URL}/crypto-chart?symbol={pair}&interval={interval}&limit={MAX_CANDLES}"
+            resp = _requests_session.get(url, timeout=30)
+            resp.raise_for_status()
             data = resp.json()
+
             candles = data.get("candles") or []
-            ohlc = [(c[0] / 1000.0, c[1], c[2], c[3], c[4]) for c in candles[-200:]]
+
+            # ✅ Handle missing or malformed data
+            if not candles:
+                print(f"⚠️ No candle data for {pair} {interval}")
+                return []
+
+            # Normalize candles into float tuples for plotting
+            ohlc = []
+            for c in candles[-200:]:
+                try:
+                    ts, o, h, l, cl = float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4])
+                    ohlc.append((ts / 1000.0, o, h, l, cl))
+                except Exception:
+                    continue
+
+            # ✅ Smooth out big timestamp gaps (avoid broken lines)
+            ohlc.sort(key=lambda x: x[0])  # ensure chronological
             return ohlc
+
         except Exception as e:
-            print("❌ Candle fetch failed:", e)
+            print(f"❌ Candle fetch failed for {pair} {interval}: {e}")
             return []
 
     def _update_main_thread(ohlc):
@@ -765,37 +801,17 @@ def refresh_candles_async():
         # Force repaint
         crypto_chart.repaint()
 
-
-
+        # Ensure autoscaling and proper visual centering
         if auto_range_needed:
             crypto_chart.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
             auto_range_needed = False
 
+    # ✅ Use your thread pool safely
     worker = Worker(_fetch_and_emit)
     worker.signals.result.connect(_update_main_thread)
     thread_pool.start(worker)
 
-
-
-    def _fetch_candles_bg():
-        url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval={interval}&limit={MAX_CANDLES}"
-        resp = _requests_session.get(url, timeout=5)
-        resp.raise_for_status()
-        raw = resp.json()
-
-        # Convert to list of (timestamp, open, high, low, close)
-        data = [
-            (
-                float(c[0]) / 1000.0,
-                float(c[1]),
-                float(c[2]),
-                float(c[3]),
-                float(c[4]),
-            )
-            for c in raw
-        ]
-        return data
-
+    # --- Optional helper retained for consistent visuals ---
     def _compute_candle_width(ohlc):
         """Compute visually consistent candle width regardless of time interval."""
         if len(ohlc) < 2:
@@ -804,54 +820,10 @@ def refresh_candles_async():
         # Get time difference between candles (in seconds)
         deltas = [ohlc[i + 1][0] - ohlc[i][0] for i in range(len(ohlc) - 1)]
         median_delta = sorted(deltas)[len(deltas) // 2]
-
-        # Convert to a sensible visual width (scale factor adjusted by trial)
         width = median_delta * 0.8
-
-        # Clamp to avoid extreme thinness or fatness
-        width = max(0.0001, min(width, 3600 * 12))  # between 0.0001s and 12h equivalent
+        width = max(0.0001, min(width, 3600 * 12))  # clamp between 0.0001s and 12h equivalent
         return width
 
-
-    def _update_chart_on_main(ohlc):
-        """Runs on GUI thread — clean, stable candle drawing."""
-
-        global current_candle_item, last_candle_ts, auto_range_needed
-
-        if not ohlc:
-            return
-
-        latest_ts = ohlc[-1][0]
-
-        # --- Candle width (fixed for all intervals) ---
-        width = 0.003  # looks balanced for all zooms, tweak between 0.002–0.005
-
-        # --- Create or update item ---
-        if current_candle_item is None:
-            current_candle_item = CandlestickItem(ohlc, chart=crypto_chart)
-            crypto_chart.addItem(current_candle_item)
-            auto_range_needed = True
-        else:
-            current_candle_item.updateData(ohlc)
-
-
-        # --- Y autoscale ---
-        highs = [c[2] for c in ohlc]
-        lows = [c[3] for c in ohlc]
-        if highs and lows:
-            y_min, y_max = min(lows), max(highs)
-            if y_max - y_min < 0.001:
-                y_min -= 0.001
-                y_max += 0.001
-            crypto_chart.setYRange(y_min, y_max, padding=0.05)
-            _lock_chart_bounds(ohlc)
-
-        # --- X autoscale on first load / interval change ---
-        if auto_range_needed:
-            crypto_chart.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
-            auto_range_needed = False
-
-        last_candle_ts = latest_ts
 
 
 def _load_more_candles_async():
@@ -871,10 +843,10 @@ def _load_more_candles_async():
     def _fetch_older():
         try:
             url = (
-                f"https://allcoin-proxy-154235898849.europe-west1.run.app/crypto-chart"
+                f"{BASE_URL}/crypto-chart"
                 f"?symbol={pair}&interval={interval}&endTime={end_time}&limit={limit}"
             )
-            resp = _requests_session.get(url, timeout=5)
+            resp = _requests_session.get(url, timeout=10)
             resp.raise_for_status()
             raw = resp.json()
             older = [
@@ -1034,67 +1006,81 @@ fiat_board.verticalHeader().setVisible(False)
 fiat_board.horizontalHeader().setStretchLastSection(True)
 fiat_board.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 fiat_board.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-fiat_board.horizontalHeader().setStretchLastSection(True)
+
+# stretch all columns evenly across width
+from PyQt6.QtWidgets import QHeaderView
 fiat_board.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
 fiat_board.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+fiat_board.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
 
 # ✅ Add to fiat layout (not main_layout anymore)
 fiat_layout_content.addWidget(fiat_board)
 
 
+# ----------------------------
+# Fiat Top Movers (replaces old board)
+# ----------------------------
 def _fetch_fiat_board_bg():
-    resp = _requests_session.get("https://allcoin-proxy-154235898849.europe-west1.run.app/fiat-board", timeout=3)
+    """Background fetch of fiat-board data from the proxy."""
+    resp = _requests_session.get(f"{BASE_URL}/fiat-board", timeout=5)
     resp.raise_for_status()
     return resp.json()
 
+
 def _update_fiat_board_on_main(data):
-    global previous_rates   # must come before first use
-    print("Previous rates before update:", len(previous_rates))
-
+    """Update the fiat_board table with Top 10 movers by % change."""
+    global previous_rates
     pairs = data.get("pairs", {})
-    fiat_board.setRowCount(len(pairs))
 
-    for row, (pair, values) in enumerate(pairs.items()):
-        cur_val = values.get("current")
-        if cur_val is None:
-            continue
+    # --- Compute movers (sorted by absolute percentage change) ---
+    movers = sorted(
+        [(pair, vals.get("current"), vals.get("change", 0.0))
+         for pair, vals in pairs.items()
+         if vals.get("current") is not None],
+        key=lambda x: abs(x[2]),
+        reverse=True
+    )[:10]  # top 10 only
 
-        current = float(cur_val)
+    fiat_board.setRowCount(len(movers))
+    fiat_board.setColumnCount(3)
+    fiat_board.setHorizontalHeaderLabels(["Pair", "Rate", "Change %"])
+    fiat_board.horizontalHeader().setStretchLastSection(True)
 
+    from PyQt6.QtGui import QColor
+
+    for row, (pair, rate, change) in enumerate(movers):
+        # Format and color rows
         pair_item = QTableWidgetItem(pair)
         pair_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
-        rate_item = QTableWidgetItem()
+
+        rate_item = QTableWidgetItem(f"{float(rate):,.4f}")
         rate_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
 
-        from PyQt6.QtGui import QColor
+        change_item = QTableWidgetItem(f"{change:+.3f}%")
+        change_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
 
-        prev = previous_rates.get(pair)
-        previous_rates[pair] = current  # update cache for next cycle
-
-        if prev is None:
-            rate_item.setForeground(QColor("#AAAAAA"))
-            rate_item.setText(f"{current:.4f} •")
+        if change > 0:
+            change_item.setForeground(QColor("#00FF00"))
+            rate_item.setForeground(QColor("#00FF00"))
+        elif change < 0:
+            change_item.setForeground(QColor("#FF3333"))
+            rate_item.setForeground(QColor("#FF3333"))
         else:
-            diff = current - prev
-            if diff > 0:
-                rate_item.setForeground(QColor("#00FF00"))
-                rate_item.setText(f"{current:.4f} ▲")
-            elif diff < 0:
-                rate_item.setForeground(QColor("#FF3333"))
-                rate_item.setText(f"{current:.4f} ▼")
-            else:
-                rate_item.setForeground(QColor("#AAAAAA"))
-                rate_item.setText(f"{current:.4f} •")
+            change_item.setForeground(QColor("#AAAAAA"))
+            rate_item.setForeground(QColor("#AAAAAA"))
 
         fiat_board.setItem(row, 0, pair_item)
         fiat_board.setItem(row, 1, rate_item)
+        fiat_board.setItem(row, 2, change_item)
 
 
 
 def update_fiat_board_async():
+    """Run the fiat board update in the background."""
     worker = Worker(_fetch_fiat_board_bg)
     worker.signals.result.connect(_update_fiat_board_on_main)
     thread_pool.start(worker)
+
 
 news_browser = QTextBrowser()
 news_browser.setOpenExternalLinks(True)
@@ -1125,20 +1111,96 @@ def update_financial_news():
 
 def update_financial_insights():
     try:
-        url = "https://allcoin-proxy-154235898849.europe-west1.run.app/insights"
-        data = requests.get(url, timeout=10).json()
-        btc_usd = data.get("btc_usd")
-        eth_usd = data.get("eth_usd")
-        eur_usd = data.get("eur_usd")
-        dax_val = data.get("dax")
-        if btc_usd:  btc_label.setText(f"BTC/USD: {btc_usd:,.0f} $")
-        if eth_usd:  eth_label.setText(f"ETH/USD: {eth_usd:,.0f} $")
-        if eur_usd:  eurusd_label.setText(f"EUR/USD: {eur_usd:.4f}")
-        if dax_val:  dax_label.setText(f"DAX: {dax_val:,.0f}")
+        # --- Get all data from your backend (cached Frankfurter + Binance) ---
+        resp = requests.get(f"{BASE_URL}/insights", timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            eur_usd = data.get("eur_usd", 0)
+            btc_usd = data.get("btc_usd", 0)
+            eth_usd = data.get("eth_usd", 0)
+            dax_val = data.get("dax", 0)
+        else:
+            print("⚠️ /insights endpoint unavailable:", resp.text)
+            eur_usd = btc_usd = eth_usd = dax_val = 0
+
+        # --- Stock / index quotes from Yahoo Finance ---
+        tickers = {
+            "S&P 500": "^GSPC",
+            "FTSE 100": "^FTSE",
+            "Apple": "AAPL",
+            "Nvidia": "NVDA",
+            "Microsoft": "MSFT",
+            "BlackRock": "BLK",
+            "Crude Oil": "CL=F",
+            "Gold": "GC=F",
+        }
+
+        y_url = "https://query1.finance.yahoo.com/v8/finance/chart/"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        quotes = {}
+
+        for name, symbol in tickers.items():
+            r = requests.get(f"{y_url}{symbol}", params={"interval": "1h"}, headers=headers, timeout=30)
+            j = r.json()
+            quotes[name] = (
+                j.get("chart", {})
+                .get("result", [{}])[0]
+                .get("meta", {})
+                .get("regularMarketPrice")
+            )
+
+        # --- OpenAI: placeholder (no public ticker yet) ---
+        quotes["OpenAI"] = "—"
+
+        # --- Update UI labels (with icons) ---
+        btc_label.setText(f"{ICON_MAP['BTC/USD']}  BTC/USD: {btc_usd:,.0f} $")
+        eth_label.setText(f"{ICON_MAP['ETH/USD']}  ETH/USD: {eth_usd:,.0f} $")
+        eurusd_label.setText(f"{ICON_MAP['EUR/USD']}  EUR/USD: {eur_usd:.4f}")
+        dax_label.setText(f"{ICON_MAP['DAX']}  DAX: {dax_val:,.0f}")  # from backend insights
+        sp_label.setText(f"{ICON_MAP['S&P 500']}  S&P 500: {quotes.get('S&P 500', 0):,.0f}")
+        ftse_label.setText(f"{ICON_MAP['FTSE 100']}  FTSE 100: {quotes.get('FTSE 100', 0):,.0f}")
+        apple_label.setText(f"{ICON_MAP['Apple']}  Apple: {quotes.get('Apple', 0):,.0f}")
+        nvda_label.setText(f"{ICON_MAP['Nvidia']}  Nvidia: {quotes.get('Nvidia', 0):,.0f}")
+        oil_label.setText(f"{ICON_MAP['Crude Oil']}  Crude Oil: {quotes.get('Crude Oil', 0):,.2f}")
+        gold_label.setText(f"{ICON_MAP['Gold']}  Gold: {quotes.get('Gold', 0):,.2f}")
+        microsoft_label.setText(f"{ICON_MAP['Microsoft']}  Microsoft: {quotes.get('Microsoft', 0):,.0f}")
+        blackrock_label.setText(f"{ICON_MAP['BlackRock']}  BlackRock: {quotes.get('BlackRock', 0):,.0f}")
+
     except Exception as e:
         print("⚠️ update_financial_insights failed:", e)
 
 
+
+
+def update_top_movers():
+    """Fetch top gainers and losers from Binance and update the Movers page."""
+    try:
+        print("🔁 update_top_movers running...")
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        data = requests.get(url, timeout=30).json()
+
+        # keep only USDT pairs
+        usdt_pairs = [d for d in data if d["symbol"].endswith("USDT")]
+
+        # sort by percent change
+        top_gainers = sorted(usdt_pairs, key=lambda x: float(x["priceChangePercent"]), reverse=True)[:5]
+        top_losers  = sorted(usdt_pairs, key=lambda x: float(x["priceChangePercent"]))[:5]
+
+        # build display strings
+        gain_text = "\n".join(
+            [f"▲ {g['symbol']}: {float(g['priceChangePercent']):.2f}%  (${float(g['lastPrice']):,.3f})"
+             for g in top_gainers]
+        )
+        lose_text = "\n".join(
+            [f"▼ {l['symbol']}: {float(l['priceChangePercent']):.2f}%  (${float(l['lastPrice']):,.3f})"
+             for l in top_losers]
+        )
+
+        top_gainers_label.setText(gain_text)
+        top_losers_label.setText(lose_text)
+
+    except Exception as e:
+        print("⚠️ update_top_movers failed:", e)
 
 
 # Refresh every 60s
@@ -1147,11 +1209,6 @@ board_timer.timeout.connect(update_fiat_board_async)
 board_timer.start(60000)
 update_fiat_board_async()  # first run immediately
 
-# --- Financial Insights auto-refresh ---
-insights_timer = QTimer()
-insights_timer.timeout.connect(update_financial_insights)
-insights_timer.start(180000)  # every 3 minutes
-update_financial_insights()   # first run
 
 # --- News auto-refresh ---
 news_timer = QTimer()
@@ -1167,34 +1224,70 @@ select_page = QWidget()
 select_layout = QVBoxLayout(select_page)
 select_layout.setSpacing(30)
 
-welcome = QLabel("Welcome! Please choose a mode:")
+welcome = QLabel("Your Global Currency & Crypto Companion")
 welcome.setAlignment(Qt.AlignmentFlag.AlignCenter)
-welcome.setStyleSheet("font-size: 18px;")
+welcome.setStyleSheet("font-size: 20px; font-weight: 600; font-family: 'Roboto Condensed'; letter-spacing: 1px;")
+
 select_layout.addWidget(welcome)
 
-
 # --- Financial Insights Panel (multi-page) ---
-insights_box = QGroupBox("Finanzielle Einblicke")
+insights_box = QGroupBox("Financial Insights")
 insights_layout = QVBoxLayout(insights_box)
-
-
 
 # Create stacked pages
 insights_stack = QStackedWidget()
 insights_layout.addWidget(insights_stack)
 
+def make_insight_label(name, value_text="loading…"):
+    """Create a unified label with icon, name, and value placeholder."""
+    icon = ICON_MAP.get(name, "")
+    label = QLabel(f"{icon}  {name}: {value_text}")
+    # neutral light gray text for content
+    label.setStyleSheet("font-size: 14px; color: #e0e0e0;")
+    return label
+
+
 # --- Page 1: Market snapshot ---
 page1 = QWidget()
 p1_layout = QGridLayout(page1)
-btc_label = QLabel("BTC/USD: loading…")
-eth_label = QLabel("ETH/USD: loading…")
-eurusd_label = QLabel("EUR/USD: loading…")
-dax_label = QLabel("DAX: loading…")
-p1_layout.addWidget(btc_label, 0, 0)
-p1_layout.addWidget(eth_label, 0, 1)
-p1_layout.addWidget(eurusd_label, 1, 0)
-p1_layout.addWidget(dax_label, 1, 1)
+
+financial_title = QLabel("The big Boys")
+financial_title.setStyleSheet(GOLD_HEADER_STYLE)
+p1_layout.addWidget(financial_title, 0, 0, 1, 2)  # span across two columns
+
+btc_label = make_insight_label("BTC/USD")
+eth_label = make_insight_label("ETH/USD")
+eurusd_label = make_insight_label("EUR/USD")
+dax_label = make_insight_label("DAX")
+sp_label = make_insight_label("S&P 500")
+ftse_label = make_insight_label("FTSE 100")
+apple_label = make_insight_label("Apple")
+nvda_label = make_insight_label("Nvidia")
+oil_label = make_insight_label("Crude Oil")
+gold_label = make_insight_label("Gold")
+microsoft_label = make_insight_label("Microsoft")
+blackrock_label = make_insight_label("BlackRock")
+
+p1_layout.addWidget(btc_label, 1, 0)
+p1_layout.addWidget(eth_label, 1, 1)
+p1_layout.addWidget(eurusd_label, 2, 0)
+p1_layout.addWidget(dax_label, 2, 1)
+p1_layout.addWidget(sp_label, 3, 0)
+p1_layout.addWidget(ftse_label, 3, 1)
+p1_layout.addWidget(apple_label, 4, 0)
+p1_layout.addWidget(nvda_label, 4, 1)
+p1_layout.addWidget(oil_label, 5, 0)
+p1_layout.addWidget(gold_label, 5, 1)
+p1_layout.addWidget(microsoft_label, 6, 0)
+p1_layout.addWidget(blackrock_label, 6, 1)
+
 insights_stack.addWidget(page1)
+
+# --- Financial Insights auto-refresh ---
+insights_timer = QTimer()
+insights_timer.timeout.connect(update_financial_insights)
+insights_timer.start(180000)  # every 3 minutes
+update_financial_insights()   # first run
 
 # --- Page 2: Financial News ---
 page2 = QWidget()
@@ -1202,12 +1295,44 @@ p2_layout = QVBoxLayout(page2)
 p2_layout.addWidget(news_browser)
 insights_stack.addWidget(page2)
 
-# --- Optional Page 3: Crypto movers (placeholder) ---
+# --- Page 3: Top Crypto Movers ---
 page3 = QWidget()
-p3_layout = QVBoxLayout(page3)
-crypto_summary = QLabel("Top crypto movers loading…")
-p3_layout.addWidget(crypto_summary)
+
+# outer layout so the title sits on top
+outer_layout = QVBoxLayout(page3)
+
+movers_title = QLabel("Top Crypto Movers")
+movers_title.setStyleSheet(GOLD_HEADER_STYLE)
+outer_layout.addWidget(movers_title)
+
+movers_layout = QHBoxLayout()
+movers_layout.setContentsMargins(20, 20, 20, 20)
+movers_layout.setSpacing(40)
+
+# Labels for gainers and losers
+top_gainers_label = QLabel("Loading top gainers…")
+top_losers_label = QLabel("Loading top losers…")
+
+# --- Timer to refresh Top Movers every 3 minutes ---
+movers_timer = QTimer()
+movers_timer.timeout.connect(update_top_movers)
+movers_timer.start(180000)  # every 3 minutes
+update_top_movers()         # run once on startup
+
+# Basic alignment and styling
+top_gainers_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+top_losers_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+top_gainers_label.setStyleSheet("font-size: 14px; color: #00ff00;")  # bright green
+top_losers_label.setStyleSheet("font-size: 14px; color: #ff5555;")   # soft red
+
+movers_layout.addWidget(top_gainers_label)
+movers_layout.addWidget(top_losers_label)
+
+outer_layout.addLayout(movers_layout)
+
 insights_stack.addWidget(page3)
+
+
 
 # --- Navigation buttons ---
 nav_row = QHBoxLayout()

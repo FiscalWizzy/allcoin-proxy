@@ -776,53 +776,6 @@ def save_cache():
     return jsonify({"status": "saved", "time": time.time()})
 
 
-
-def warmup_insights():
-    """Instantly populate the insights snapshot on startup."""
-    global insights_snapshot
-
-    try:
-        _log("INFO", "⚡ Running startup warm-up for insights…")
-
-        # BTC & ETH
-        btc_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=8)
-        eth_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=8)
-        btc_usd = float(btc_resp.json().get("price", 0))
-        eth_usd = float(eth_resp.json().get("price", 0))
-
-        # EUR/USD via cached function (avoids 429s)
-        eur_usd = get_exchange_rate_cached("EUR", "USD")
-
-        # DAX (Yahoo)
-        headers = {"User-Agent": "Mozilla/5.0"}
-        dax_resp = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/%5EGDAXI",
-            params={"interval": "1h"},
-            headers=headers,
-            timeout=8,
-        )
-        dax_json = dax_resp.json()
-        dax_val = (
-            dax_json.get("chart", {}).get("result", [{}])[0]
-            .get("meta", {}).get("regularMarketPrice")
-        )
-
-        with _cache_lock:
-            insights_snapshot = {
-                "btc_usd": btc_usd,
-                "eth_usd": eth_usd,
-                "eur_usd": eur_usd,
-                "dax": dax_val,
-                "timestamp": time.time(),
-            }
-
-        _log("INFO", f"✅ Warm-up complete — BTC={btc_usd}, ETH={eth_usd}, EUR/USD={eur_usd}, DAX={dax_val}")
-
-    except Exception as e:
-        _log("INFO", f"⚠️ Warm-up failed: {e}")
-
-
-# -----
 # Main
 # -----
 if __name__ == "__main__":
