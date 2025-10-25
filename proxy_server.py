@@ -430,7 +430,7 @@ def _fiat_board_loop():
             if not daily_baseline.get("rates"):
                 try:
                     from datetime import date, timedelta
-                    yesterday = (date.today() - timedelta(days=1)).isoformat()
+                    yesterday = (date.today() - timedelta(days=3)).isoformat()
                     yest_data = http_get_json(f"https://api.frankfurter.app/{yesterday}?from=USD", timeout=10)
                     yest_rates = yest_data.get("rates", {}) or {}
                     if yest_rates:
