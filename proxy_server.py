@@ -71,6 +71,9 @@ _backfill_done = {iv: False for iv in TRACKED_INTERVALS}
 
 all_fiat_rates: dict = {}
 
+# ✅ Daily baseline for 24-hour movement comparison
+daily_baseline = {"timestamp": 0, "rates": {}}
+
 
 # -------------
 # Flask & HTTP
@@ -406,53 +409,50 @@ def _background_history_cache():
 # -----------------------
 
 def _fiat_board_loop():
-    """Fetch and cache all fiat rates from Frankfurter; keep top-10 movers for the UI."""
-    global all_fiat_rates, fiat_board_snapshot, last_fiat_rates
+    """Fetch and cache all fiat rates from Frankfurter; keep top-10 daily movers."""
+    global all_fiat_rates, fiat_board_snapshot, last_fiat_rates, daily_baseline
 
     while True:
         try:
-            # --- Fetch complete USD base rates ---
             usd_data = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
             rates = usd_data.get("rates", {}) or {}
-
             if not rates:
                 raise ValueError("Empty data from Frankfurter")
 
-            # ✅ Store entire rate map for use by /convert
+            now = time.time()
+
+            # --- set or reset baseline every 24 h ---
+            if now - daily_baseline["timestamp"] > 86400 or not daily_baseline["rates"]:
+                daily_baseline["timestamp"] = now
+                daily_baseline["rates"] = rates.copy()
+                _log("INFO", "🌅 New daily baseline set for fiat rates.")
+
+            # --- compute % change vs baseline ---
+            changes = {}
+            for cur, val in rates.items():
+                base_val = daily_baseline["rates"].get(cur, val)
+                if not base_val:
+                    pct = 0.0
+                else:
+                    pct = ((val / base_val) - 1) * 100
+                changes[cur] = {"current": val, "baseline": base_val, "change": pct}
+
+            # --- select top-10 movers ---
+            top10 = sorted(changes.items(), key=lambda kv: abs(kv[1]["change"]), reverse=True)[:10]
+            pairs_out = {f"USD_{k}": v for k, v in top10}
+
+            # --- update caches ---
             with _cache_lock:
                 all_fiat_rates = rates.copy()
+                fiat_board_snapshot = {"pairs": pairs_out, "timestamp": now}
 
-            # --- Compute % deltas for top-movers display ---
-            deltas = {}
-            for cur, val in rates.items():
-                prev = last_fiat_rates.get(cur)
-                if prev and prev != 0:
-                    deltas[cur] = abs((val - prev) / prev)
-                else:
-                    deltas[cur] = 0.0
-
-            top10 = sorted(deltas, key=deltas.get, reverse=True)[:10]
-
-            pairs_out = {}
-            for cur in top10:
-                prev = last_fiat_rates.get(cur, rates[cur])
-                pairs_out[f"USD_{cur}"] = {
-                    "current": rates[cur],
-                    "previous": prev,
-                    "change_pct": ((rates[cur] - prev) / prev * 100) if prev else 0.0,
-                }
-                last_fiat_rates[cur] = rates[cur]
-
-            # ✅ Update fiat board snapshot for UI
-            with _cache_lock:
-                fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
-
-            _log("INFO", f"✅ Cached {len(all_fiat_rates)} total rates; board shows top-10 movers: {list(pairs_out.keys())}")
+            _log("INFO", f"✅ Cached {len(all_fiat_rates)} total rates; top-10 daily movers ready.")
 
         except Exception as e:
             _log("INFO", f"⚠️ Fiat board update failed: {e}")
 
         time.sleep(FIAT_REFRESH)
+
 
 
 # -----------------------
@@ -558,6 +558,15 @@ def warmup_fiat_board():
         except Exception as e:
             _log("INFO", f"⚠️ Fiat board warm-up failed: {e} — retrying in {retry_delay}s")
             time.sleep(retry_delay)
+
+
+def manual_refresh_fiat():
+    try:
+        requests.get(f"{BASE_URL}/refresh-fiat", timeout=10)
+        time.sleep(1)  # short delay for backend to update cache
+        update_financial_insights()  # your function that redraws board
+    except Exception as e:
+        print("⚠️ Manual refresh failed:", e)
 
 
 # -------------------
@@ -804,25 +813,27 @@ def refresh_fiat():
             all_fiat_rates = rates.copy()
 
         # Compute movement deltas
-        deltas = {}
-        for cur, val in rates.items():
-            prev = last_fiat_rates.get(cur)
-            if prev and prev != 0:
-                deltas[cur] = abs((val - prev) / prev)
-            else:
-                deltas[cur] = 0.0
+        # --- update baseline if older than 24 h ---
+        now = time.time()
+        if now - daily_baseline["timestamp"] > 86400 or not daily_baseline["rates"]:
+            daily_baseline["timestamp"] = now
+            daily_baseline["rates"] = rates.copy()
+            _log("INFO", "🌅 New daily baseline set (manual refresh).")
 
-        # Pick top 10 movers
-        top10 = sorted(deltas, key=deltas.get, reverse=True)[:10]
-        pairs_out = {}
-        for cur in top10:
-            prev = last_fiat_rates.get(cur, rates[cur])
-            pairs_out[f"USD_{cur}"] = {
-                "current": rates[cur],
-                "previous": prev,
-                "change_pct": ((rates[cur] - prev) / prev * 100) if prev else 0.0,
-            }
-            last_fiat_rates[cur] = rates[cur]
+        # --- compute % change vs baseline ---
+        changes = {}
+        for cur, val in rates.items():
+            base_val = daily_baseline["rates"].get(cur, val)
+            if not base_val:
+                pct = 0.0
+            else:
+                pct = ((val / base_val) - 1) * 100
+            changes[cur] = {"current": val, "baseline": base_val, "change": pct}
+
+        # --- pick top-10 movers ---
+        top10 = sorted(changes.items(), key=lambda kv: abs(kv[1]["change"]), reverse=True)[:10]
+        pairs_out = {f"USD_{k}": v for k, v in top10}
+
 
         with _cache_lock:
             fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
