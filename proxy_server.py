@@ -836,7 +836,7 @@ def refresh_fiat():
         # --- Determine baseline (yesterday) and latest (today) ---
         import datetime
         today = datetime.date.today()
-        yesterday = today - datetime.timedelta(days=1)
+        yesterday = today - datetime.timedelta(days=2)
         today_str = today.isoformat()
         yest_str = yesterday.isoformat()
 
