@@ -144,6 +144,9 @@ last_price: Dict[str, float] = {}
 last_fiat_rates: Dict[str, float] = {}
 fiat_board_snapshot: Dict = {}
 
+daily_baseline: Dict = {"day": None, "timestamp": 0, "rates": {}}
+
+
 # Insights snapshot
 insights_snapshot: Dict = {}
 
@@ -284,7 +287,7 @@ def _backfill_history(interval: str):
             end_time = int(time.time() * 1000)
             all_rows = []
 
-            for _ in range(5):  # 5 × 1000 = 5000 max
+            for _ in range(2):  # 5 × 1000 = 5000 max
                 # Retry wrapper for robustness
                 for attempt in range(3):
                     try:
@@ -430,7 +433,7 @@ def _fiat_board_loop():
             if not daily_baseline.get("rates"):
                 try:
                     from datetime import date, timedelta
-                    yesterday = (date.today() - timedelta(days=3)).isoformat()
+                    yesterday = (date.today() - timedelta(days=1)).isoformat()
                     yest_data = http_get_json(f"https://api.frankfurter.app/{yesterday}?from=USD", timeout=10)
                     yest_rates = yest_data.get("rates", {}) or {}
                     if yest_rates:
@@ -610,7 +613,7 @@ def start_threads():
 
     # Staggered backfill (to avoid RAM spike)
     for idx, iv in enumerate(TRACKED_INTERVALS):
-        threading.Timer(idx * 10, lambda iv=iv: _backfill_history(iv)).start()
+        threading.Timer(idx * 60, lambda iv=iv: _backfill_history(iv)).start()
 
     # Other loops
     threading.Thread(target=_fiat_board_loop, daemon=True).start()
@@ -824,59 +827,74 @@ def debug_info():
 
 @app.route("/refresh-fiat")
 def refresh_fiat():
-    """Manually trigger a one-time fiat board and full cache refresh."""
+    """Manually trigger a one-time fiat board and full cache refresh (baseline vs latest)."""
     global all_fiat_rates, fiat_board_snapshot, last_fiat_rates
+
     try:
         _log("INFO", "🔄 Manual fiat refresh triggered…")
 
-        usd_data = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
-        rates = usd_data.get("rates", {}) or {}
+        # --- Determine baseline (yesterday) and latest (today) ---
+        import datetime
+        today = datetime.date.today()
+        yesterday = today - datetime.timedelta(days=1)
+        today_str = today.isoformat()
+        yest_str = yesterday.isoformat()
 
-        if not rates:
+        # --- Fetch baseline and latest from Frankfurter ---
+        baseline_data = http_get_json(f"https://api.frankfurter.app/{yest_str}?from=USD", timeout=10)
+        latest_data   = http_get_json(f"https://api.frankfurter.app/latest?from=USD", timeout=10)
+
+        # --- Debug info ---
+        _log("INFO", f"📅 Baseline date: {yest_str} → {baseline_data.get('date')}")
+        _log("INFO", f"📅 Latest date:   {today_str} → {latest_data.get('date')}")
+        sample_keys = list(latest_data.get("rates", {}))[:5]
+        for k in sample_keys:
+            old = baseline_data["rates"].get(k)
+            new = latest_data["rates"].get(k)
+            _log("INFO", f"🔍 {k}: baseline={old}, latest={new}")
+
+        base_rates = baseline_data.get("rates", {}) or {}
+        latest_rates = latest_data.get("rates", {}) or {}
+
+        if not latest_rates:
             return jsonify({"error": "No data returned from Frankfurter"}), 503
 
         # ✅ Update full cache
         with _cache_lock:
-            all_fiat_rates = rates.copy()
+            all_fiat_rates = latest_rates.copy()
 
-        # Compute movement deltas
-        # --- update baseline if older than 24 h ---
-        now = time.time()
-        if now - daily_baseline["timestamp"] > 86400 or not daily_baseline["rates"]:
-            daily_baseline["timestamp"] = now
-            daily_baseline["rates"] = rates.copy()
-            _log("INFO", "🌅 New daily baseline set (manual refresh).")
-
-        # --- compute % change vs baseline ---
-        changes = {}
-        for cur, val in rates.items():
-            base_val = daily_baseline["rates"].get(cur, val)
-            if not base_val:
-                pct = 0.0
+        # --- Compute % change between baseline and latest ---
+        pairs_out = {}
+        for cur, new_val in latest_rates.items():
+            old_val = base_rates.get(cur)
+            if not old_val:
+                change_pct = 0.0
             else:
-                pct = ((val / base_val) - 1) * 100
-            changes[cur] = {"current": val, "baseline": base_val, "change": pct}
+                change_pct = ((new_val - old_val) / old_val) * 100.0
 
-        # --- pick top-10 movers ---
-        top10 = sorted(changes.items(), key=lambda kv: abs(kv[1]["change"]), reverse=True)[:10]
-        pairs_out = {f"USD_{k}": v for k, v in top10}
+            pairs_out[f"USD_{cur}"] = {
+                "baseline": old_val or new_val,
+                "current": new_val,
+                "change": round(change_pct, 3)
+            }
 
+        # --- Sort by absolute % change and keep top 10 ---
+        top10 = dict(sorted(pairs_out.items(), key=lambda x: abs(x[1]["change"]), reverse=True)[:10])
 
         with _cache_lock:
-            fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
+            fiat_board_snapshot = {"pairs": top10, "timestamp": time.time()}
 
-        _log("INFO", f"✅ Manual fiat refresh complete: {len(all_fiat_rates)} total cached; board shows top-10 movers.")
-
+        _log("INFO", f"✅ Manual fiat refresh complete — {len(top10)} top movers ready.")
         return jsonify({
             "message": "Manual fiat refresh complete",
-            "total_rates": len(all_fiat_rates),
-            "top_movers": list(pairs_out.keys()),
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "top_movers": list(top10.keys())
         })
 
     except Exception as e:
         _log("INFO", f"⚠️ Manual fiat refresh failed: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 
 @app.route("/save-cache")
