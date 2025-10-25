@@ -409,25 +409,50 @@ def _background_history_cache():
 # -----------------------
 
 def _fiat_board_loop():
-    """Fetch and cache all fiat rates from Frankfurter; keep top-10 daily movers."""
+    """
+    Fetch and cache all fiat rates from Frankfurter;
+    keep top-10 daily movers compared to the previous day.
+    """
     global all_fiat_rates, fiat_board_snapshot, last_fiat_rates, daily_baseline
 
     while True:
         try:
+            # --- Fetch today’s USD base rates ---
             usd_data = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
             rates = usd_data.get("rates", {}) or {}
             if not rates:
                 raise ValueError("Empty data from Frankfurter")
 
             now = time.time()
+            current_day = time.strftime("%Y-%m-%d", time.gmtime())
 
-            # --- set or reset baseline every 24 h ---
-            if now - daily_baseline["timestamp"] > 86400 or not daily_baseline["rates"]:
-                daily_baseline["timestamp"] = now
-                daily_baseline["rates"] = rates.copy()
-                _log("INFO", "🌅 New daily baseline set for fiat rates.")
+            # --- If baseline is empty, try to prime it with yesterday’s data ---
+            if not daily_baseline.get("rates"):
+                try:
+                    from datetime import date, timedelta
+                    yesterday = (date.today() - timedelta(days=1)).isoformat()
+                    yest_data = http_get_json(f"https://api.frankfurter.app/{yesterday}?from=USD", timeout=10)
+                    yest_rates = yest_data.get("rates", {}) or {}
+                    if yest_rates:
+                        daily_baseline = {
+                            "day": yesterday,
+                            "timestamp": now,
+                            "rates": yest_rates.copy(),
+                        }
+                        _log("INFO", f"🕓 Baseline primed with yesterday’s rates ({yesterday})")
+                except Exception as e:
+                    _log("INFO", f"⚠️ Could not fetch yesterday’s rates: {e}")
 
-            # --- compute % change vs baseline ---
+            # --- Reset baseline once per new calendar day ---
+            if daily_baseline.get("day") != current_day:
+                daily_baseline = {
+                    "day": current_day,
+                    "timestamp": now,
+                    "rates": rates.copy(),
+                }
+                _log("INFO", f"🌅 New daily baseline set for {current_day}")
+
+            # --- Compute % change vs. baseline ---
             changes = {}
             for cur, val in rates.items():
                 base_val = daily_baseline["rates"].get(cur, val)
@@ -437,21 +462,23 @@ def _fiat_board_loop():
                     pct = ((val / base_val) - 1) * 100
                 changes[cur] = {"current": val, "baseline": base_val, "change": pct}
 
-            # --- select top-10 movers ---
+            # --- Select top-10 movers by absolute change ---
             top10 = sorted(changes.items(), key=lambda kv: abs(kv[1]["change"]), reverse=True)[:10]
             pairs_out = {f"USD_{k}": v for k, v in top10}
 
-            # --- update caches ---
+            # --- Update caches safely ---
             with _cache_lock:
                 all_fiat_rates = rates.copy()
                 fiat_board_snapshot = {"pairs": pairs_out, "timestamp": now}
 
-            _log("INFO", f"✅ Cached {len(all_fiat_rates)} total rates; top-10 daily movers ready.")
+            _log("INFO", f"✅ Cached {len(all_fiat_rates)} rates; top-10 movers ready for {current_day}")
 
         except Exception as e:
             _log("INFO", f"⚠️ Fiat board update failed: {e}")
 
+        # --- Wait until next refresh window ---
         time.sleep(FIAT_REFRESH)
+
 
 
 
