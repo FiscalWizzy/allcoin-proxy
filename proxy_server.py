@@ -151,22 +151,20 @@ daily_baseline: Dict = {"day": None, "timestamp": 0, "rates": {}}
 insights_snapshot: Dict = {}
 
 def _save_cache():
-    """Persist in-memory caches to disk (with tuple key handling)."""
+    """Persist in-memory caches to disk (compact and memory-safe)."""
     with _cache_lock:
         try:
-            # Convert tuple keys like ("BTCUSDT", "1m") → "BTCUSDT|1m"
-            candle_cache_serializable = {f"{k[0]}|{k[1]}": v for k, v in candle_cache.items()}
-
+            # Use compact separators to reduce file size dramatically
             with open(CANDLE_FILE, "w") as f:
-                json.dump(candle_cache_serializable, f)
+                json.dump(candle_cache, f, indent=None, separators=(',', ':'))
 
             with open(FIAT_FILE, "w") as f:
-                json.dump(fiat_board_snapshot, f)
+                json.dump(fiat_board_snapshot, f, indent=None, separators=(',', ':'))
 
             with open(INSIGHTS_FILE, "w") as f:
-                json.dump(insights_snapshot, f)
+                json.dump(insights_snapshot, f, indent=None, separators=(',', ':'))
 
-            _log("INFO", "💾 Cache saved successfully.")
+            _log("INFO", "💾 Cache saved successfully (compact mode).")
         except Exception as e:
             _log("INFO", f"⚠️ Cache save failed: {e}")
 
@@ -252,7 +250,7 @@ def _fetch_klines(symbol: str, interval: str, limit: int = 200, end_time_ms: Opt
 
     for attempt in range(3):  # up to 3 retries
         try:
-            return http_get_json(url, timeout=10, params=params)
+            return http_get_json(url, timeout=6, params=params)
         except requests.exceptions.RequestException as e:
             wait = 2 ** attempt
             _log("INFO", f"⚠️ Retry {attempt+1}/3 for {symbol} {interval} after {wait}s: {e}")
