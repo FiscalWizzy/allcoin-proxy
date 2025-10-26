@@ -60,8 +60,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 FIAT_FILE = os.path.join(DATA_DIR, "fiat.json")
 INSIGHTS_FILE = os.path.join(DATA_DIR, "insights.json")
 
-_backfill_done = {iv: False for iv in TRACKED_INTERVALS}
-
 all_fiat_rates: dict = {}
 
 # ✅ Daily baseline for 24-hour movement comparison
