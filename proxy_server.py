@@ -121,6 +121,18 @@ def get_exchange_rate_cached(base: str, quote: str) -> float | None:
     return None
 
 
+def get_crypto_price(symbol: str) -> float | None:
+    """Fetch a single crypto pair price (e.g., BTCUSDT) from Binance."""
+    try:
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        return float(data["price"])
+    except Exception as e:
+        _log("INFO", f"⚠️ get_crypto_price failed for {symbol}: {e}")
+        return None
+
+
 # -------------
 # In-memory cache
 # -------------
@@ -518,6 +530,25 @@ def convert():
 
     if from_cur == to_cur:
         return jsonify({"from": from_cur, "to": to_cur, "amount": amount, "converted": amount})
+
+    # --- Handle crypto ↔ fiat or crypto ↔ crypto conversions ---
+    # If either currency looks like a crypto symbol, try Binance
+    crypto_symbols = {"BTC", "ETH", "XRP", "DOGE", "LTC", "SOL", "ADA", "DOT", "TRX", "AR", "LINK", "RENDER"}
+    if from_cur in crypto_symbols or to_cur in crypto_symbols:
+        pair = f"{from_cur}{to_cur}".upper()
+        price = get_crypto_price(pair)
+        if price is None:
+            # Try the reverse pair (e.g., USD → BTC)
+            rev_pair = f"{to_cur}{from_cur}".upper()
+            rev_price = get_crypto_price(rev_pair)
+            if rev_price is None:
+                return jsonify({"error": f"No price available for {from_cur}/{to_cur}"}), 503
+            converted = amount / rev_price
+            return jsonify({"from": from_cur, "to": to_cur, "amount": amount, "converted": round(converted, 8)})
+
+        converted = amount * price
+        return jsonify({"from": from_cur, "to": to_cur, "amount": amount, "converted": round(converted, 8)})
+
 
     # Reconstruct rates relative to USD
     if from_cur == "USD":
