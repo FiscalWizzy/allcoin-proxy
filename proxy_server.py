@@ -44,7 +44,7 @@ TRACKED_INTERVALS = ["5m", "1h", "1d"]
 
 
 # Candles memory bounds
-MAX_CANDLES_PER_KEY = 20000 # about 2 weeks per interval
+MAX_CANDLES_PER_KEY = 5000  # safe and sufficient
 RETURN_CANDLES = 200
 
 # Fiat board cadence (seconds)
@@ -288,7 +288,7 @@ def _backfill_history(interval: str):
             end_time = int(time.time() * 1000)
             all_rows = []
 
-            for _ in range(20):  # 20 × 1000 = 20,000 max — deeper backfill for scrolling
+            for _ in range(3):  # 3 × 1000 = 3000 max
                 # Retry wrapper for robustness
                 for attempt in range(3):
                     try:
@@ -320,6 +320,8 @@ def _backfill_history(interval: str):
 
         completed += 1
         _log("INFO", f"🎯 Backfill progress {interval}: ({completed}/{total_symbols})")
+
+        time.sleep(2)  # throttle to avoid load spikes
 
     _log("INFO", f"🎉 Backfill complete for interval {interval}")
 
