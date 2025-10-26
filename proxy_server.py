@@ -368,24 +368,19 @@ def manual_refresh_fiat():
 
 
 # -------------------
-# Thread orchestration
+# Thread orchestration (chart-free)
 # -------------------
 def start_threads():
+    """Start only the essential background threads (fiat board + insights)."""
     # --- Warm-up before starting background loops ---
     warmup_insights()
     warmup_fiat_board()
 
-    # Live updaters
-    for iv in TRACKED_INTERVALS:
-        threading.Thread(target=_candles_loop, args=(iv,), daemon=True).start()
-
-    # Staggered backfill (to avoid RAM spike)
-    for idx, iv in enumerate(TRACKED_INTERVALS):
-        threading.Timer(idx * 60, lambda iv=iv: _backfill_history(iv)).start()
-
-    # Other loops
+    # --- Background updaters ---
     threading.Thread(target=_fiat_board_loop, daemon=True).start()
     threading.Thread(target=_insights_loop, daemon=True).start()
+
+    _log("INFO", "✅ Background threads started (no chart threads).")
 
 
 
