@@ -40,12 +40,6 @@ TRACKED_SYMBOLS = [
     "LINKUSDT", "RENDERUSDT", "LTCUSDT", "SOLUSDT",
     "BCHUSDT", "ETCUSDT", "ADAUSDT", "TRXUSDT", "DOTUSDT",
 ]
-TRACKED_INTERVALS = ["5m", "1h", "1d"]
-
-
-# Candles memory bounds
-MAX_CANDLES_PER_KEY = 5000  # safe and sufficient
-RETURN_CANDLES = 200
 
 # Fiat board cadence (seconds)
 FIAT_REFRESH = 1800  # 30 min
@@ -63,7 +57,6 @@ STRICT_CACHE_ONLY = True  # do not hit Binance inside request handler
 DATA_DIR = "/tmp/allcoin_cache"  # Render allows writing to /tmp
 os.makedirs(DATA_DIR, exist_ok=True)
 
-CANDLE_FILE = os.path.join(DATA_DIR, "candles.json")
 FIAT_FILE = os.path.join(DATA_DIR, "fiat.json")
 INSIGHTS_FILE = os.path.join(DATA_DIR, "insights.json")
 
@@ -135,8 +128,6 @@ def get_exchange_rate_cached(base: str, quote: str) -> float | None:
 # -------------
 _cache_lock = threading.Lock()
 
-# candle_cache[(symbol, interval)] = List[ (ts_sec, open, high, low, close) ]
-candle_cache: Dict[Tuple[str, str], List[Tuple[float, float, float, float, float]]] = {}
 # last trade price cache: last_price[symbol] = float
 last_price: Dict[str, float] = {}
 
@@ -154,30 +145,22 @@ def _save_cache():
     """Persist in-memory caches to disk (compact and memory-safe)."""
     with _cache_lock:
         try:
-            # Use compact separators to reduce file size dramatically
-            with open(CANDLE_FILE, "w") as f:
-                json.dump(candle_cache, f, indent=None, separators=(',', ':'))
-
+            # Save only fiat board and insights (chart caching removed)
             with open(FIAT_FILE, "w") as f:
                 json.dump(fiat_board_snapshot, f, indent=None, separators=(',', ':'))
 
             with open(INSIGHTS_FILE, "w") as f:
                 json.dump(insights_snapshot, f, indent=None, separators=(',', ':'))
 
-            _log("INFO", "💾 Cache saved successfully (compact mode).")
+            _log("INFO", "💾 Cache saved successfully (compact mode, no chart cache).")
         except Exception as e:
             _log("INFO", f"⚠️ Cache save failed: {e}")
 
 
 def _load_cache():
-    """Load cached data from disk, restoring tuple keys."""
-    global candle_cache, fiat_board_snapshot, insights_snapshot
+    """Load cached fiat and insights data from disk."""
+    global fiat_board_snapshot, insights_snapshot
     try:
-        if os.path.exists(CANDLE_FILE):
-            with open(CANDLE_FILE, "r") as f:
-                data = json.load(f)
-                candle_cache = {tuple(k.split("|")): v for k, v in data.items()}
-
         if os.path.exists(FIAT_FILE):
             with open(FIAT_FILE, "r") as f:
                 fiat_board_snapshot = json.load(f)
@@ -186,226 +169,10 @@ def _load_cache():
             with open(INSIGHTS_FILE, "r") as f:
                 insights_snapshot = json.load(f)
 
-        _log("INFO", "♻️ Cache restored from disk.")
+        _log("INFO", "♻️ Cache restored from disk (fiat + insights only).")
     except Exception as e:
         _log("INFO", f"⚠️ Cache load failed: {e}")
 
-
-
-# ---------------------------
-# Helpers for candle merging
-# ---------------------------
-def _normalize_klines(raw_klines) -> List[Tuple[float, float, float, float, float]]:
-    out = []
-    for c in raw_klines:
-        try:
-            out.append((
-                float(c[0]) / 1000.0,
-                float(c[1]),
-                float(c[2]),
-                float(c[3]),
-                float(c[4]),
-            ))
-        except Exception:
-            continue
-    out.sort(key=lambda x: x[0])  # ✅ ensure chronological order
-    return out
-
-
-def _merge_extend(key, new_rows):
-    """Upsert by timestamp and cap to MAX_CANDLES_PER_KEY."""
-    with _cache_lock:
-        cur = candle_cache.get(key, [])
-        all_rows = cur + new_rows
-        # ✅ Deduplicate by timestamp
-        seen = {}
-        for ts, o, h, l, c in sorted(all_rows, key=lambda r: r[0]):
-            seen[ts] = (ts, o, h, l, c)
-        merged = list(seen.values())[-MAX_CANDLES_PER_KEY:]
-        candle_cache[key] = merged
-
-
-
-def _get_cached_slice(key, end_ts: Optional[float], limit: int) -> List[Tuple[float, float, float, float, float]]:
-    with _cache_lock:
-        rows = candle_cache.get(key, [])
-        if not rows:
-            return []
-        if end_ts is None:
-            return rows[-limit:]
-        # filter rows strictly older-or-equal to end_ts
-        filtered = [r for r in rows if r[0] <= end_ts]
-        return filtered[-limit:] if filtered else []
-
-
-
-# --------------------------
-# Background: Crypto candles
-# --------------------------
-def _fetch_klines(symbol: str, interval: str, limit: int = 200, end_time_ms: Optional[int] = None):
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    if end_time_ms is not None:
-        params["endTime"] = end_time_ms
-    url = f"{BINANCE_API}/api/v3/klines"
-
-    for attempt in range(3):  # up to 3 retries
-        try:
-            return http_get_json(url, timeout=6, params=params)
-        except requests.exceptions.RequestException as e:
-            wait = 2 ** attempt
-            _log("INFO", f"⚠️ Retry {attempt+1}/3 for {symbol} {interval} after {wait}s: {e}")
-            time.sleep(wait)
-    raise Exception(f"❌ Failed to fetch {symbol} {interval} after 3 retries")
-
-
-def _bounded_extend(key, new_rows):
-    """Append new candle rows to cache and cap list length."""
-    with _cache_lock:
-        cur = candle_cache.get(key, [])
-        all_rows = cur + new_rows
-        # Deduplicate by timestamp
-        seen = {}
-        for ts, o, h, l, c in sorted(all_rows, key=lambda r: r[0]):
-            seen[ts] = (ts, o, h, l, c)
-        merged = list(seen.values())
-        if len(merged) > MAX_CANDLES_PER_KEY:
-            merged = merged[-MAX_CANDLES_PER_KEY:]
-        candle_cache[key] = merged
-
-
-
-def _backfill_history(interval: str):
-    """One-time startup backfill for each tracked symbol."""
-    symbols = TRACKED_SYMBOLS[:]
-    total_symbols = len(symbols)
-    completed = 0
-
-    for sym in symbols:
-        try:
-            _log("INFO", f"⬅️ Backfilling {sym} {interval}…")
-            end_time = int(time.time() * 1000)
-            all_rows = []
-
-            for _ in range(3):  # 3 × 1000 = 3000 max
-                # Retry wrapper for robustness
-                for attempt in range(3):
-                    try:
-                        raw = _fetch_klines(sym, interval, limit=1000, end_time_ms=end_time)
-                        break
-                    except Exception as e:
-                        wait = 2 ** attempt
-                        _log("INFO", f"⚠️ Retry {attempt+1}/3 for {sym} {interval} after {wait}s: {e}")
-                        time.sleep(wait)
-                else:
-                    _log("INFO", f"❌ Skipping {sym} {interval} after 3 retries")
-                    break
-
-                rows = _normalize_klines(raw)
-                if not rows:
-                    break
-                all_rows = rows + all_rows
-                end_time = int(rows[0][0] * 1000) - 1  # move backward
-                time.sleep(0.3)  # throttle to avoid 429s
-
-            if all_rows:
-                _bounded_extend((sym, interval), all_rows)
-                with _cache_lock:
-                    last_price[sym] = all_rows[-1][4]
-            _log("INFO", f"✅ Backfilled {sym} {interval}: {len(all_rows)} candles")
-
-        except Exception as e:
-            _log("INFO", f"⚠️ Backfill failed {sym} {interval}: {e}")
-
-        completed += 1
-        _log("INFO", f"🎯 Backfill progress {interval}: ({completed}/{total_symbols})")
-
-        time.sleep(2)  # throttle to avoid load spikes
-
-    _log("INFO", f"🎉 Backfill complete for interval {interval}")
-
-
-    # --- Track global backfill completion ---
-    global _backfill_done
-    with _cache_lock:
-        _backfill_done[interval] = True
-
-    if all(_backfill_done.get(iv, False) for iv in TRACKED_INTERVALS):
-        _log("INFO", "🎉 All intervals backfilled successfully!")
-
-
-def _update_candles_for(symbols: List[str], interval: str):
-    for sym in symbols:
-        try:
-            raw = _fetch_klines(sym, interval, limit=200)
-            rows = _normalize_klines(raw)
-            if not rows:
-                continue
-            _merge_extend((sym, interval), rows)
-            # Update last price from the last close
-            with _cache_lock:
-                last_price[sym] = rows[-1][4]
-            _log("DEBUG", f"✅ {sym} {interval}: {len(rows)} new, cache={len(candle_cache.get((sym, interval), []))}")
-        except Exception as e:
-            _log("INFO", f"⚠️ Candles failed {sym} {interval}: {e}")
-
-def _candles_loop(interval: str):
-    # Runs forever with its own cadence
-    cadence = CADENCE.get(interval, 30)
-    while True:
-        started = time.time()
-        _update_candles_for(TRACKED_SYMBOLS, interval)
-        took = time.time() - started
-        sleep_for = max(1.0, cadence - took)
-        _log("INFO", f"⏱️ {interval} batch took {took:.1f}s; sleeping {sleep_for:.1f}s")
-        time.sleep(sleep_for)
-
-def _background_history_cache():
-    """
-    Keep a small rolling cache (e.g. last 300–600 candles) per tracked pair & interval.
-    Works quietly in the background and never triggers rate-limit spikes.
-    """
-    max_keep = 600        # keep ~600 candles in memory
-    fetch_batch = 200     # fetch this many per update
-    sleep_between_pairs = 4.0  # seconds between symbols (to avoid 429s)
-
-    while True:
-        for interval in TRACKED_INTERVALS:
-            for sym in TRACKED_SYMBOLS:
-                try:
-                    key = (sym, interval)
-                    with _cache_lock:
-                        cur = candle_cache.get(key, [])
-                        have = len(cur)
-                        latest_ts = cur[-1][0] * 1000 if cur else None
-
-                    # If we have fewer than half the desired cache, top it up
-                    if have < max_keep // 2:
-                        params = {"symbol": sym, "interval": interval, "limit": fetch_batch}
-                        if latest_ts:
-                            params["endTime"] = int(latest_ts)
-                        raw = http_get_json(f"{BINANCE_API}/api/v3/klines", timeout=10, params=params)
-                        rows = _normalize_klines(raw)
-                        if not rows:
-                            continue
-
-                        # Merge safely
-                        _bounded_extend(key, rows)
-
-                        # Cap memory
-                        with _cache_lock:
-                            candle_cache[key] = candle_cache[key][-max_keep:]
-
-                        _log("INFO", f"🕓 Cached {len(rows)} new candles for {sym} {interval} (cache={len(candle_cache[key])})")
-
-                    time.sleep(sleep_between_pairs)
-
-                except Exception as e:
-                    _log("INFO", f"⚠️ Cache refill failed {sym} {interval}: {e}")
-                    time.sleep(2)
-
-        # Whole cycle done — rest before starting again
-        _log("INFO", "💤 History cache cycle complete — sleeping 10m")
-        time.sleep(600)  # run every 10 minutes
 
 
 # -----------------------
@@ -623,9 +390,25 @@ def start_threads():
 
 
 def _periodic_save():
+    """Periodically save only fiat + insights cache, safely and efficiently."""
+    last_save_time = 0
+    save_interval = 300  # 5 minutes
+
     while True:
-        time.sleep(300)  # every 5 minutes
-        _save_cache()
+        try:
+            # Only save if something exists in memory
+            if fiat_board_snapshot or insights_snapshot:
+                _save_cache()
+                last_save_time = time.time()
+                _log("INFO", f"💾 Periodic save complete at {time.strftime('%H:%M:%S')}")
+            else:
+                _log("DEBUG", "🕓 Skipping save (no data yet).")
+        except Exception as e:
+            _log("INFO", f"⚠️ Periodic save failed: {e}")
+
+        # Sleep until next save
+        time.sleep(save_interval)
+
 
 threading.Thread(target=_periodic_save, daemon=True).start()
 
@@ -725,38 +508,6 @@ def insights():
     if not data:
         return jsonify({"error": "no cached data yet"}), 503
     return jsonify(data)
-
-@app.route("/crypto-chart")
-def crypto_chart():
-    """
-    Serve cached candles only — always instant and rate-limit safe.
-    The background cache thread keeps it filled automatically.
-    """
-    symbol = request.args.get("symbol", "BTCUSDT").upper()
-    interval = request.args.get("interval", "1m")
-    limit = int(request.args.get("limit", str(RETURN_CANDLES)))
-    
-    end_time = request.args.get("endTime")
-    if end_time:
-        try:
-            end_time = int(end_time)
-        except Exception:
-            end_time = None
-
-    end_ts = float(end_time) / 1000.0 if end_time else None
-
-    key = (symbol, interval)
-    rows = _get_cached_slice(key, end_ts=end_ts, limit=limit)
-
-    # ⚠️ Strict cache-only: don't call Binance from here anymore
-    if not rows:
-        _log("INFO", f"⚠️ No cached data for {symbol} {interval}")
-        return jsonify({"error": "no cached data yet"}), 503
-
-    out = [[int(r[0] * 1000), r[1], r[2], r[3], r[4]] for r in rows]
-    return jsonify({"candles": out})
-
-
 
 
 @app.route("/convert")
