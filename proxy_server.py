@@ -40,11 +40,11 @@ TRACKED_SYMBOLS = [
     "LINKUSDT", "RENDERUSDT", "LTCUSDT", "SOLUSDT",
     "BCHUSDT", "ETCUSDT", "ADAUSDT", "TRXUSDT", "DOTUSDT",
 ]
-TRACKED_INTERVALS = ["1m", "5m", "1h", "1d"]
+TRACKED_INTERVALS = ["5m", "1h", "1d"]
 
 
 # Candles memory bounds
-MAX_CANDLES_PER_KEY = 5000
+MAX_CANDLES_PER_KEY = 20000 # about 2 weeks per interval
 RETURN_CANDLES = 200
 
 # Fiat board cadence (seconds)
@@ -151,35 +151,47 @@ daily_baseline: Dict = {"day": None, "timestamp": 0, "rates": {}}
 insights_snapshot: Dict = {}
 
 def _save_cache():
-    """Persist in-memory caches to disk."""
+    """Persist in-memory caches to disk (with tuple key handling)."""
     with _cache_lock:
         try:
+            # Convert tuple keys like ("BTCUSDT", "1m") → "BTCUSDT|1m"
+            candle_cache_serializable = {f"{k[0]}|{k[1]}": v for k, v in candle_cache.items()}
+
             with open(CANDLE_FILE, "w") as f:
-                json.dump(candle_cache, f)
+                json.dump(candle_cache_serializable, f)
+
             with open(FIAT_FILE, "w") as f:
                 json.dump(fiat_board_snapshot, f)
+
             with open(INSIGHTS_FILE, "w") as f:
                 json.dump(insights_snapshot, f)
+
             _log("INFO", "💾 Cache saved successfully.")
         except Exception as e:
             _log("INFO", f"⚠️ Cache save failed: {e}")
 
+
 def _load_cache():
-    """Load cached data from disk if present."""
+    """Load cached data from disk, restoring tuple keys."""
     global candle_cache, fiat_board_snapshot, insights_snapshot
     try:
         if os.path.exists(CANDLE_FILE):
             with open(CANDLE_FILE, "r") as f:
-                candle_cache = json.load(f)
+                data = json.load(f)
+                candle_cache = {tuple(k.split("|")): v for k, v in data.items()}
+
         if os.path.exists(FIAT_FILE):
             with open(FIAT_FILE, "r") as f:
                 fiat_board_snapshot = json.load(f)
+
         if os.path.exists(INSIGHTS_FILE):
             with open(INSIGHTS_FILE, "r") as f:
                 insights_snapshot = json.load(f)
+
         _log("INFO", "♻️ Cache restored from disk.")
     except Exception as e:
         _log("INFO", f"⚠️ Cache load failed: {e}")
+
 
 
 # ---------------------------
@@ -206,25 +218,14 @@ def _merge_extend(key, new_rows):
     """Upsert by timestamp and cap to MAX_CANDLES_PER_KEY."""
     with _cache_lock:
         cur = candle_cache.get(key, [])
-        if not cur:
-            # First fill
-            candle_cache[key] = new_rows[-MAX_CANDLES_PER_KEY:]
-            return
+        all_rows = cur + new_rows
+        # ✅ Deduplicate by timestamp
+        seen = {}
+        for ts, o, h, l, c in sorted(all_rows, key=lambda r: r[0]):
+            seen[ts] = (ts, o, h, l, c)
+        merged = list(seen.values())[-MAX_CANDLES_PER_KEY:]
+        candle_cache[key] = merged
 
-        # Build an index for fast overwrite
-        idx = {t: i for i, (t, *_rest) in enumerate(cur)}
-        for row in new_rows:
-            t = row[0]
-            if t in idx:
-                cur[idx[t]] = row  # overwrite existing candle for same openTime
-            else:
-                cur.append(row)    # append newer candle
-
-        # Cap memory
-        if len(cur) > MAX_CANDLES_PER_KEY:
-            cur = cur[-MAX_CANDLES_PER_KEY:]
-
-        candle_cache[key] = cur
 
 
 def _get_cached_slice(key, end_ts: Optional[float], limit: int) -> List[Tuple[float, float, float, float, float]]:
@@ -287,7 +288,7 @@ def _backfill_history(interval: str):
             end_time = int(time.time() * 1000)
             all_rows = []
 
-            for _ in range(2):  # 5 × 1000 = 5000 max
+            for _ in range(20):  # 20 × 1000 = 20,000 max — deeper backfill for scrolling
                 # Retry wrapper for robustness
                 for attempt in range(3):
                     try:
@@ -836,7 +837,7 @@ def refresh_fiat():
         # --- Determine baseline (yesterday) and latest (today) ---
         import datetime
         today = datetime.date.today()
-        yesterday = today - datetime.timedelta(days=2)
+        yesterday = today - datetime.timedelta(days=1)
         today_str = today.isoformat()
         yest_str = yesterday.isoformat()
 
