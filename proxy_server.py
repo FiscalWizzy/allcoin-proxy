@@ -527,11 +527,25 @@ def health():
 
 @app.route("/fiats")
 def fiats():
-    with _cache_lock:
-        rates = all_fiat_rates.copy() if all_fiat_rates else {}
-    # include USD explicitly as base
-    fiats = sorted(set(["USD"] + list(rates.keys())))
-    return jsonify({"fiats": fiats, "timestamp": time.time()})
+    global all_fiat_rates
+
+    # If cache empty → fetch USD base once
+    if not all_fiat_rates:
+        try:
+            data = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=USD", timeout=10)
+            rates = data.get("rates", {}) or {}
+            with _cache_lock:
+                all_fiat_rates = rates.copy()
+            _log("INFO", f"✅ Cached {len(all_fiat_rates)} fiat rates")
+        except Exception as e:
+            return jsonify({"fiats": [], "error": f"fetch failed: {e}"}), 503
+
+    fiats = sorted(list(all_fiat_rates.keys()))
+    return jsonify({
+        "fiats": fiats,
+        "timestamp": time.time()
+    })
+
 
 @app.route("/cryptos")
 def cryptos():
@@ -563,127 +577,114 @@ def insights():
 
 @app.route("/convert")
 def convert():
-    """Convert fiat ↔ fiat or crypto ↔ crypto/fiat using cached data ONLY."""
-
+    """Convert fiat ↔ fiat or crypto ↔ fiat using cached Frankfurter + Binance prices."""
     from_cur = request.args.get("from", "").upper()
     to_cur = request.args.get("to", "").upper()
     amount = request.args.get("amount", type=float, default=1.0)
 
-    if not from_cur or not to_cur:
-        return jsonify({"error": "missing from/to"}), 400
+    crypto_symbols = {"BTC", "ETH", "XRP", "DOGE", "SOL", "ADA", "LTC", "DOT", "TRX", "AR", "LINK", "RENDER"}
 
-    # ✅ Load cached copies
-    with _cache_lock:
-        fiats = all_fiat_rates.copy() if all_fiat_rates else {}
-        crypto_map = {b: set(qs) for b, qs in crypto_quotes_map.items()}
-        prices = last_price.copy()
+    # Helper: fetch crypto price from Binance
+    def get_crypto_price(symbol: str) -> float | None:
+        try:
+            url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}"
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                return float(r.json().get("price", 0))
+        except Exception as e:
+            _log("INFO", f"⚠️ get_crypto_price failed: {e}")
+        return None
 
-    crypto_symbols = set(crypto_map.keys())
-
-    # Helper: lookup cached Binance price
-    def price_of(symbol: str) -> float | None:
-        return prices.get(symbol.upper())
-
-    # ===========================
-    # ✅ Crypto Cases (dynamic!)
-    # ===========================
+    # ✅ Case 1: crypto involved
     if from_cur in crypto_symbols or to_cur in crypto_symbols:
         try:
-            # Direct route e.g. BTC→USDT => BTCUSDT
-            direct = price_of(f"{from_cur}{to_cur}")
+            # Direct pair attempt
+            direct = get_crypto_price(f"{from_cur}{to_cur}")
             if direct:
-                return jsonify({
-                    "from": from_cur, "to": to_cur,
-                    "amount": amount,
-                    "converted": round(amount * direct, 8)
-                })
+                return jsonify({"from": from_cur, "to": to_cur,
+                                "amount": amount,
+                                "converted": round(amount * direct, 8)})
 
-            # Reverse route e.g. USD→BTC => BTCUSD
-            reverse = price_of(f"{to_cur}{from_cur}")
+            # Reverse pair attempt
+            reverse = get_crypto_price(f"{to_cur}{from_cur}")
             if reverse:
-                return jsonify({
-                    "from": from_cur, "to": to_cur,
-                    "amount": amount,
-                    "converted": round(amount / reverse, 8)
-                })
+                return jsonify({"from": from_cur, "to": to_cur,
+                                "amount": amount,
+                                "converted": round(amount / reverse, 8)})
 
-            # Crypto ↔ Crypto via USD stable (USDT)
+            # Bridge crypto↔crypto through USDT
             if from_cur in crypto_symbols and to_cur in crypto_symbols:
-                base_usdt = price_of(f"{from_cur}USDT")
-                tgt_usdt = price_of(f"{to_cur}USDT")
-                if base_usdt and tgt_usdt:
-                    converted = amount * (base_usdt / tgt_usdt)
-                    return jsonify({
-                        "from": from_cur, "to": to_cur,
-                        "amount": amount,
-                        "converted": round(converted, 8)
-                    })
+                b2usdt = get_crypto_price(f"{from_cur}USDT")
+                usdt2t = get_crypto_price(f"{to_cur}USDT")
+                if b2usdt and usdt2t:
+                    return jsonify({"from": from_cur, "to": to_cur,
+                                    "amount": amount,
+                                    "converted": round(amount * (b2usdt / usdt2t), 8)})
 
-            # Crypto → Fiat via USDT bridge
-            if from_cur in crypto_symbols and to_cur in fiats:
-                base_usdt = price_of(f"{from_cur}USDT")
-                usd_to_target = fiats.get(to_cur, 1)
-                if base_usdt and usd_to_target:
-                    converted = amount * base_usdt * usd_to_target
-                    return jsonify({
-                        "from": from_cur, "to": to_cur,
-                        "amount": amount,
-                        "converted": round(converted, 8)
-                    })
+            # Bridge crypto↔fiat through USDT
+            with _cache_lock:
+                rates = all_fiat_rates.copy() if all_fiat_rates else {}
 
-            # Fiat → Crypto via USDT bridge
-            if from_cur in fiats and to_cur in crypto_symbols:
-                target_usdt = price_of(f"{to_cur}USDT")
-                usd_to_base = 1 / fiats.get(from_cur, 1)
-                if target_usdt and usd_to_base:
-                    converted = amount * usd_to_base / target_usdt
-                    return jsonify({
-                        "from": from_cur, "to": to_cur,
-                        "amount": amount,
-                        "converted": round(converted, 8)
-                    })
+            # Lazy fill fiat cache (for crypto↔fiat)
+            if not rates:
+                data = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=USD", timeout=10)
+                rates = data.get("rates", {})
+                if rates:
+                    with _cache_lock:
+                        all_fiat_rates = rates.copy()
 
-            return jsonify({"error": f"no cached price for {from_cur}/{to_cur}"}), 503
+            if from_cur in crypto_symbols:  # crypto → fiat
+                b2usdt = get_crypto_price(f"{from_cur}USDT")
+                usd_to_t = rates.get(to_cur)
+                if b2usdt and usd_to_t:
+                    return jsonify({"from": from_cur, "to": to_cur,
+                                    "amount": amount,
+                                    "converted": round(amount * b2usdt * usd_to_t, 8)})
+
+            if to_cur in crypto_symbols:  # fiat → crypto
+                t2usdt = get_crypto_price(f"{to_cur}USDT")
+                usd_to_b = 1 / rates.get(from_cur, 1)
+                if t2usdt and usd_to_b:
+                    return jsonify({"from": from_cur, "to": to_cur,
+                                    "amount": amount,
+                                    "converted": round(amount * usd_to_b / t2usdt, 8)})
+
+            return jsonify({"error": f"No price available for {from_cur}/{to_cur}"}), 503
 
         except Exception as e:
-            return jsonify({"error": f"crypto convert failed: {e}"}), 500
+            return jsonify({"error": f"Crypto conversion failed: {e}"}), 500
 
-    # ===========================
-    # ✅ Pure Fiat Cases
-    # ===========================
-    if not fiats:
-        return jsonify({"error": "no cached fiat data yet"}), 503
+    # ✅ Case 2: pure fiat conversion — guaranteed by fallback below
+    with _cache_lock:
+        rates = all_fiat_rates.copy() if all_fiat_rates else {}
+
+    # If cache empty → fetch **once** now (non-blocking fallback)
+    if not rates:
+        try:
+            data = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=USD", timeout=10)
+            rates = data.get("rates", {})
+            if rates:
+                with _cache_lock:
+                    all_fiat_rates = rates.copy()
+        except Exception as e:
+            return jsonify({"error": f"fiat unavailable: {e}"}), 503
+
+    if not rates:
+        return jsonify({"error": "fiat unavailable"}), 503
 
     if from_cur == to_cur:
-        return jsonify({
-            "from": from_cur,
-            "to": to_cur,
-            "amount": amount,
-            "converted": amount
-        })
+        return jsonify({"from": from_cur, "to": to_cur,
+                        "amount": amount, "converted": amount})
 
-    # Make both relative to USD
-    if from_cur == "USD":
-        base_to_usd = 1.0
-    elif from_cur in fiats:
-        base_to_usd = 1 / fiats[from_cur]
-    else:
-        return jsonify({"error": f"unsupported base {from_cur}"}), 400
-
-    if to_cur == "USD":
-        usd_to_target = 1.0
-    elif to_cur in fiats:
-        usd_to_target = fiats[to_cur]
-    else:
-        return jsonify({"error": f"unsupported target {to_cur}"}), 400
+    # Reconstruct via USD (Frankfurter format)
+    base_to_usd = 1.0 if from_cur == "USD" else (1 / rates.get(from_cur, 1))
+    usd_to_target = 1.0 if to_cur == "USD" else rates.get(to_cur, 1)
 
     converted = amount * base_to_usd * usd_to_target
-    return jsonify({
-        "from": from_cur,
-        "to": to_cur,
-        "amount": amount,
-        "converted": round(converted, 6)
-    })
+    return jsonify({"from": from_cur, "to": to_cur,
+                    "amount": amount,
+                    "converted": round(converted, 6),
+                    "timestamp": time.time()})
 
 
 
