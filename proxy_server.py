@@ -560,11 +560,30 @@ def cryptos():
 
 @app.route("/fiat-board")
 def fiat_board():
+    global fiat_board_snapshot, all_fiat_rates
+
     with _cache_lock:
-        data = fiat_board_snapshot.copy() if fiat_board_snapshot else None
-    if not data:
-        return jsonify({"error": "no cached data yet"}), 503
-    return jsonify(data)
+        snapshot = fiat_board_snapshot.copy() if fiat_board_snapshot else {}
+
+    # ✅ If cache empty → fetch live data now and populate snapshot
+    if not snapshot:
+        try:
+            data = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=USD", timeout=10)
+            rates = data.get("rates", {})
+            if rates:
+                with _cache_lock:
+                    all_fiat_rates = rates.copy()
+                    fiat_board_snapshot = {
+                        "pairs": {f"USD_{k}": {"current": v, "change": 0.0}
+                                  for k, v in rates.items()},
+                        "timestamp": time.time()
+                    }
+                snapshot = fiat_board_snapshot.copy()
+        except Exception:
+            return jsonify({"error": "no cached data yet"}), 503
+
+    return jsonify(snapshot)
+
 
 @app.route("/insights")
 def insights():
@@ -577,6 +596,7 @@ def insights():
 
 @app.route("/convert")
 def convert():
+    global all_fiat_rates  
     """Convert fiat ↔ fiat or crypto ↔ fiat using cached Frankfurter + Binance prices."""
     from_cur = request.args.get("from", "").upper()
     to_cur = request.args.get("to", "").upper()
