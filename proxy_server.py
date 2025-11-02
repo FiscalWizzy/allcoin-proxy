@@ -77,16 +77,6 @@ _session = requests.Session()
 
 _threads_started = False
 
-@app.before_request
-def activate_background_threads():
-    global _threads_started
-    if not _threads_started:
-        _threads_started = True
-        _log("INFO", "🚀 Bootstrapping background threads for Render (Flask 3.x)...")
-        start_threads()
-
-
-
 
 def _log(level: str, *args):
     if LOG_LEVEL == "DEBUG" or level != "DEBUG":
@@ -804,10 +794,8 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
 
 else:
-    _log("INFO", "🚀 Gunicorn/Render environment detected – loading cache and starting threads.")
+    _log("INFO", "🚀 Gunicorn/Render environment detected – loading cache only (threads already running).")
     _load_cache()
-    threading.Thread(target=start_threads, daemon=True).start()
+    _log("INFO", "✅ Using existing cached data; background threads managed externally.")
 
-    # Background periodic saver
-    threading.Thread(target=lambda: (time.sleep(5), _periodic_save()), daemon=True).start()
 
