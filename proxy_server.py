@@ -97,29 +97,27 @@ def http_get_json(url: str, timeout: float = 10.0, params: Optional[dict] = None
     resp.raise_for_status()
     return resp.json()
 
-def get_exchange_rate_cached(base: str, quote: str) -> float | None:
-    """Fetch exchange rates from Frankfurter once per hour and reuse."""
-    key = f"{base}_{quote}"
-    now = time.time()
+def get_exchange_rate_cached(base: str, quote: str):
+    with _cache_lock:
+        rates = all_fiat_rates.copy() if all_fiat_rates else {}
 
-    # Serve from cache if still fresh
-    if key in _exchange_cache:
-        rate, ts = _exchange_cache[key]
-        if now - ts < _exchange_cache_ttl:
-            return rate
+    if not rates:
+        return None
+    
+    # Direct: USD → OTHER
+    if base == "USD":
+        return rates.get(quote)
 
-    try:
-        resp = requests.get(
-            f"https://api.frankfurter.app/latest?from={base}&to={quote}",
-            timeout=10
-        )
-        data = resp.json()
-        rate = data["rates"].get(quote)
-        if rate:
-            _exchange_cache[key] = (rate, now)
-            return rate
-    except Exception as e:
-        print(f"⚠️ get_exchange_rate_cached failed: {e}")
+    # Reverse: OTHER → USD
+    if quote == "USD":
+        return 1 / rates.get(base, 0) if rates.get(base) else None
+
+    # Cross: OTHER → OTHER
+    usd_base = get_exchange_rate_cached(base, "USD")
+    usd_quote = get_exchange_rate_cached(quote, "USD")
+
+    if usd_base and usd_quote:
+        return usd_base * usd_quote
 
     return None
 
@@ -376,39 +374,30 @@ def warmup_fiat_board():
 
     while True:
         try:
-            _log("INFO", "⚡ Running startup warm-up for fiat board…")
-            print(f"🌍 DEBUG: EXCHANGE_RATE_API_URL = {EXCHANGE_RATE_API_URL}", flush=True)
+            _log("INFO", "⚡ Warm-up: Fetching latest USD base rates…")
+            usd_data = http_get_json(f"https://api.frankfurter.app/latest?from=USD", timeout=20)
+            rates = usd_data.get("rates", {}) or {}
+            if not rates:
+                raise ValueError("No data from Frankfurter")
 
-
-            usd = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=USD", timeout=10)
-            eur = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=EUR", timeout=10)
-
-            usd_rates = usd.get("rates", {}) or {}
-            eur_rates = eur.get("rates", {}) or {}
-
-
-            pairs = {
-                "USD_EUR": usd_rates.get("EUR"),
-                "GBP_USD": (1 / usd_rates["GBP"]) if usd_rates.get("GBP") else None,
-                "USD_JPY": usd_rates.get("JPY"),
-                "USD_CHF": usd_rates.get("CHF"),
-                "AUD_USD": (1 / usd_rates["AUD"]) if usd_rates.get("AUD") else None,
-                "USD_CAD": usd_rates.get("CAD"),
-                "EUR_GBP": eur_rates.get("GBP"),
-            }
+            now = time.time()
 
             with _cache_lock:
-                pairs_out = {}
-                for k, cur in pairs.items():
-                    if cur is None:
-                        continue
-                    prev = last_fiat_rates.get(k, cur)
-                    pairs_out[k] = {"current": cur, "previous": prev}
-                    last_fiat_rates[k] = cur
-                fiat_board_snapshot = {"pairs": pairs_out, "timestamp": time.time()}
+                all_fiat_rates = rates.copy()
+                # initialize fiat board without day comparison yet
+                fiat_board_snapshot = {
+                    "pairs": {
+                        f"USD_{k}": {"current": v, "previous": v}
+                        for k, v in rates.items()
+                    },
+                    "timestamp": now,
+                }
+                last_fiat_rates = rates.copy()
 
-            _log("INFO", f"✅ Fiat board warm-up complete with {len(pairs_out)} pairs.")
-            break  # ✅ success → stop retrying
+            _log("INFO", f"✅ Warm-up: {len(all_fiat_rates)} fiat rates loaded")
+
+            break
+
 
         except Exception as e:
             _log("INFO", f"⚠️ Fiat board warm-up failed: {e} — retrying in {retry_delay}s")
