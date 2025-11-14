@@ -76,7 +76,7 @@ app = Flask(__name__)
 _session = requests.Session()
 
 _threads_started = False
-
+_threads_lock = threading.Lock()
 
 def _log(level: str, *args):
     if LOG_LEVEL == "DEBUG" or level != "DEBUG":
@@ -407,16 +407,28 @@ def manual_refresh_fiat():
 # Thread orchestration (chart-free)
 # -------------------
 def start_threads():
-    # --- Warm-up before starting background loops ---
-    warmup_insights()
-    warmup_fiat_board()
+    """Kick off warmups concurrently, then start loops. Never block import."""
+    def bootstrap():
+        # run warmups in parallel so a slow one doesn't block the other
+        t_ins = threading.Thread(target=warmup_insights, daemon=True)
+        t_fiat = threading.Thread(target=warmup_fiat_board, daemon=True)
+        t_ins.start(); t_fiat.start()
 
-    # 🔥 Crypto backfill & candle loops REMOVED 🔥
+        # (optional) wait a little, but never block forever
+        t_ins.join(timeout=15)
+        t_fiat.join(timeout=15)
 
-    # Only keep the two background loops you actually need
-    threading.Thread(target=_fiat_board_loop, daemon=True).start()
-    threading.Thread(target=_insights_loop, daemon=True).start()
-    threading.Thread(target=_binance_snapshot_loop, daemon=True).start()
+        # start the recurring loops regardless; endpoints can serve 503 until warm data exists
+        threading.Thread(target=_insights_loop, daemon=True).start()
+        threading.Thread(target=_fiat_board_loop, daemon=True).start()
+
+        # only start if you actually implemented this loop; otherwise remove this line
+        try:
+            threading.Thread(target=_binance_snapshot_loop, daemon=True).start()
+        except NameError:
+            pass
+
+    threading.Thread(target=bootstrap, daemon=True).start()
 
 
 
@@ -441,6 +453,15 @@ def _periodic_save():
         # Sleep until next save
         time.sleep(save_interval)
 
+def ensure_background_threads():
+    global _threads_started
+    if _threads_started:
+        return
+    with _threads_lock:
+        if _threads_started:
+            return
+        _threads_started = True
+        threading.Thread(target=start_threads, daemon=True).start()
 
 threading.Thread(target=_periodic_save, daemon=True).start()
 
@@ -523,10 +544,15 @@ def _insights_loop():
 # -----------
 @app.route("/health")
 def health():
+
     return jsonify({"ok": True, "time": time.time()})
+
 
 @app.route("/fiats")
 def fiats():
+    
+    ensure_background_threads()
+
     global all_fiat_rates
 
     # If cache empty → fetch USD base once
@@ -547,8 +573,15 @@ def fiats():
     })
 
 
+@app.before_request
+def _ensure_bg():
+    ensure_background_threads()
+
+
 @app.route("/cryptos")
 def cryptos():
+    ensure_background_threads()
+
     with _cache_lock:
         cq = {b: qs[:] for b, qs in crypto_quotes_map.items()}
     payload = {
@@ -560,6 +593,8 @@ def cryptos():
 
 @app.route("/fiat-board")
 def fiat_board():
+    ensure_background_threads()
+
     global fiat_board_snapshot, all_fiat_rates
 
     with _cache_lock:
@@ -587,6 +622,8 @@ def fiat_board():
 
 @app.route("/insights")
 def insights():
+    ensure_background_threads()
+
     with _cache_lock:
         data = insights_snapshot.copy() if insights_snapshot else None
     if not data:
@@ -596,6 +633,8 @@ def insights():
 
 @app.route("/convert")
 def convert():
+    ensure_background_threads()
+
     global all_fiat_rates  
     """Convert fiat ↔ fiat or crypto ↔ fiat using cached Frankfurter + Binance prices."""
     from_cur = request.args.get("from", "").upper()
@@ -710,6 +749,7 @@ def convert():
 
 @app.route("/debug")
 def debug_info():
+
     with _cache_lock:
         counts = {f"{k[0]}:{k[1]}": len(v) for k, v in candle_cache.items()}
         data = {
@@ -725,6 +765,8 @@ def debug_info():
 
 @app.route("/refresh-fiat")
 def refresh_fiat():
+    ensure_background_threads()
+
     """Manually trigger a one-time fiat board and full cache refresh (baseline vs latest)."""
     global all_fiat_rates, fiat_board_snapshot, last_fiat_rates
 
@@ -797,6 +839,7 @@ def refresh_fiat():
 
 @app.route("/save-cache")
 def save_cache():
+
     _save_cache()
     return jsonify({"status": "saved", "time": time.time()})
 
