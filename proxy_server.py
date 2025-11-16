@@ -78,6 +78,10 @@ _session = requests.Session()
 _threads_started = False
 _threads_lock = threading.Lock()
 
+# ---- Fiat name map (server-side cache) ----
+fiat_names_map: dict[str, str] = {}   # e.g. {"EUR": "Euro", "USD": "US Dollar"}
+
+
 def _log(level: str, *args):
     if LOG_LEVEL == "DEBUG" or level != "DEBUG":
         print(*args, flush=True)
@@ -220,9 +224,10 @@ def _load_cache():
 
 
 
-# -----------------------
-# Background: Fiat board
-# -----------------------
+# NEW: previous poll snapshot for intraday comparison
+
+prev_rates_intraday: Dict[str, float] = {}
+
 
 def _fiat_board_loop():
     """
@@ -358,40 +363,98 @@ def warmup_insights():
 
 
 def warmup_fiat_board():
-    """Instantly populate fiat_board_snapshot on startup, with auto-retry."""
-    global fiat_board_snapshot, last_fiat_rates
+    """
+    Startup warm-up for the fiat board:
+    - fetch USD base 'latest' and (if possible) yesterday
+    - compute % change vs baseline
+    - build Top-10 movers into fiat_board_snapshot['pairs']
+    - seed caches (all_fiat_rates, last_fiat_rates, prev_rates_intraday)
+    """
+    global fiat_board_snapshot, last_fiat_rates, all_fiat_rates, daily_baseline, prev_rates_intraday
     retry_delay = 120  # seconds
 
     while True:
         try:
-            _log("INFO", "⚡ Warm-up: Fetching latest USD base rates…")
-            usd_data = http_get_json(f"https://api.frankfurter.app/latest?from=USD", timeout=20)
-            rates = usd_data.get("rates", {}) or {}
-            if not rates:
-                raise ValueError("No data from Frankfurter")
+            _log("INFO", "⚡ Running startup warm-up for fiat board…")
+
+            # Fetch latest USD base rates
+            latest = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
+            latest_rates = latest.get("rates", {}) or {}
+            if not latest_rates:
+                raise ValueError("Empty latest rates from Frankfurter")
+
+            # Try to fetch yesterday for 24h baseline
+            from datetime import date, timedelta
+            yest_str = (date.today() - timedelta(days=1)).isoformat()
+            try:
+                yest = http_get_json(f"https://api.frankfurter.app/{yest_str}?from=USD", timeout=10)
+                baseline_rates = yest.get("rates", {}) or {}
+            except Exception as e:
+                _log("INFO", f"⚠️ Could not fetch yesterday ({yest_str}); using latest as baseline: {e}")
+                baseline_rates = latest_rates.copy()
+
+            # Compute 24h % change vs baseline
+            entries = []
+            for cur, new_val in latest_rates.items():
+                old_val = baseline_rates.get(cur, new_val)
+                change_pct = ((new_val / old_val) - 1.0) * 100.0 if old_val else 0.0
+                entries.append((cur, new_val, change_pct))
+
+            # Top 10 movers by absolute % change
+            top10 = sorted(entries, key=lambda x: abs(x[2]), reverse=True)[:10]
+            pairs_out = {
+                f"USD_{cur}": {"current": val, "change": round(pct, 3), "basis": "24h"}
+                for (cur, val, pct) in top10
+            }
 
             now = time.time()
-
+            # Seed caches so later loops & /convert work immediately
             with _cache_lock:
-                all_fiat_rates = rates.copy()
-                # initialize fiat board without day comparison yet
-                fiat_board_snapshot = {
-                    "pairs": {
-                        f"USD_{k}": {"current": v, "previous": v}
-                        for k, v in rates.items()
-                    },
+                all_fiat_rates = latest_rates.copy()
+                last_fiat_rates = {f"USD_{cur}": latest_rates[cur] for cur in latest_rates}
+                prev_rates_intraday = latest_rates.copy()
+                daily_baseline = {
+                    "day": date.today().isoformat(),
                     "timestamp": now,
+                    "rates": baseline_rates.copy(),
                 }
-                last_fiat_rates = rates.copy()
+                fiat_board_snapshot = {"pairs": pairs_out, "timestamp": now}
 
-            _log("INFO", f"✅ Warm-up: {len(all_fiat_rates)} fiat rates loaded")
-
-            break
-
+            _log("INFO", f"✅ Fiat board warm-up complete — {len(pairs_out)} pairs in snapshot.")
+            return  # success
 
         except Exception as e:
             _log("INFO", f"⚠️ Fiat board warm-up failed: {e} — retrying in {retry_delay}s")
             time.sleep(retry_delay)
+
+
+
+
+def _fiat_names_warmup():
+    global fiat_names_map
+    try:
+        j = http_get_json(f"{EXCHANGE_RATE_API_URL}/currencies", timeout=10)
+        if isinstance(j, dict):
+            fiat_names_map = {k.upper(): v for k, v in j.items()}
+            _log("INFO", f"✅ Loaded {len(fiat_names_map)} fiat names")
+    except Exception as e:
+        _log("INFO", f"⚠️ _fiat_names_warmup failed: {e}")
+
+
+def _ensure_fiat_names_loaded():
+    global fiat_names_map
+    if fiat_names_map:
+        return
+    try:
+        j = http_get_json(f"{EXCHANGE_RATE_API_URL}/currencies", timeout=10)  # {"USD":"US Dollar",...}
+        if isinstance(j, dict) and j:
+            with _cache_lock:
+                fiat_names_map = j.copy()
+            _log("INFO", f"✅ Loaded {len(fiat_names_map)} fiat names")
+        else:
+            _log("INFO", "⚠️ /currencies returned empty; using code-only labels")
+    except Exception as e:
+        _log("INFO", f"⚠️ Could not load fiat names: {e} — using code-only labels")
 
 
 def manual_refresh_fiat():
@@ -550,12 +613,14 @@ def health():
 
 @app.route("/fiats")
 def fiats():
-    
     ensure_background_threads()
 
-    global all_fiat_rates
+    global all_fiat_rates, fiat_names_map
 
-    # If cache empty → fetch USD base once
+    # 1) Ensure we have names (best effort; code still works without)
+    _ensure_fiat_names_loaded()
+
+    # 2) Ensure we have the rate cache at least once so we know which fiats exist
     if not all_fiat_rates:
         try:
             data = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=USD", timeout=10)
@@ -564,18 +629,50 @@ def fiats():
                 all_fiat_rates = rates.copy()
             _log("INFO", f"✅ Cached {len(all_fiat_rates)} fiat rates")
         except Exception as e:
-            return jsonify({"fiats": [], "error": f"fetch failed: {e}"}), 503
+            return jsonify({"fiats": [], "items": [], "error": f"fetch failed: {e}"}), 503
 
-    fiats = sorted(list(all_fiat_rates.keys()))
+    # 3) Build response: codes + rich items
+    with _cache_lock:
+        codes = sorted(list(all_fiat_rates.keys())) or []
+
+    items = []
+    for c in codes:
+        name = fiat_names_map.get(c, c)
+        items.append({
+            "code": c,
+            "name": name,
+            "label": f"{name} ({c})"
+        })
+
     return jsonify({
-        "fiats": fiats,
+        "fiats": codes,
+        "items": items,
         "timestamp": time.time()
     })
+
 
 
 @app.before_request
 def _ensure_bg():
     ensure_background_threads()
+
+@app.route("/crypto-bases")
+def crypto_bases():
+    """List all available crypto base symbols."""
+    with _cache_lock:
+        bases = sorted(list(crypto_quotes_map.keys()))
+    return jsonify({"bases": bases, "timestamp": time.time()})
+
+
+@app.route("/crypto-quotes")
+def crypto_quotes():
+    """List valid quote symbols for a given base."""
+    base = (request.args.get("base") or "").upper()
+    with _cache_lock:
+        quotes = crypto_quotes_map.get(base, [])
+    if not quotes:
+        return jsonify({"base": base, "quotes": [], "error": "unknown base"}), 404
+    return jsonify({"base": base, "quotes": quotes, "timestamp": time.time()})
 
 
 @app.route("/cryptos")
