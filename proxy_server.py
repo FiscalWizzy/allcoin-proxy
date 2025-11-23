@@ -808,7 +808,11 @@ def convert():
     to_cur = request.args.get("to", "").upper()
     amount = request.args.get("amount", type=float, default=1.0)
 
-    crypto_symbols = {"BTC", "ETH", "XRP", "DOGE", "SOL", "ADA", "LTC", "DOT", "TRX", "AR", "LINK", "RENDER"}
+    with _cache_lock:
+        crypto_bases_set  = set(crypto_quotes_map.keys())
+        crypto_quotes_set = set(q for qs in crypto_quotes_map.values() for q in qs)
+    crypto_symbols = crypto_bases_set | crypto_quotes_set
+
 
     # Helper: fetch crypto price from Binance
     def get_crypto_price(symbol: str) -> float | None:
