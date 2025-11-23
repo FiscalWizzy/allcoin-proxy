@@ -128,45 +128,55 @@ def get_crypto_price(symbol: str) -> float | None:
         return None
 
 def _prime_binance_snapshot_once():
-    """Fetch all Binance tickers once and build crypto_quotes_map + last_price."""
+    """Fetch Binance exchangeInfo + prices once and build crypto_quotes_map + last_price."""
     global last_price, crypto_quotes_map
 
-    r = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=10)
-    r.raise_for_status()
-    data = r.json()
+    # 1) Get all valid symbols with true base/quote
+    info_r = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=10)
+    info_r.raise_for_status()
+    info = info_r.json()
 
+    symbols = info.get("symbols", [])
+    if not isinstance(symbols, list):
+        raise ValueError("Binance exchangeInfo returned invalid payload")
 
-    # ✅ Guard against rate-limit / bad responses
+    cq: Dict[str, set] = {}
+    valid_pairs = set()
+
+    for s in symbols:
+        if s.get("status") != "TRADING":
+            continue
+        base = s.get("baseAsset")
+        quote = s.get("quoteAsset")
+        sym = s.get("symbol")
+        if base and quote and sym:
+            cq.setdefault(base, set()).add(quote)
+            valid_pairs.add(sym)
+
+    # 2) Get latest prices
+    price_r = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=10)
+    price_r.raise_for_status()
+    data = price_r.json()
     if not isinstance(data, list):
-        raise ValueError(f"Binance returned non-list payload: {str(data)[:120]}")
-
+        raise ValueError("Binance price endpoint returned non-list payload")
 
     lp: Dict[str, float] = {}
-    cq: Dict[str, set] = {}
-
     for item in data:
-        sym = item.get("symbol", "")
+        sym = item.get("symbol")
         p = item.get("price")
-        if not sym or p is None:
-            continue
-        try:
-            lp[sym] = float(p)
-        except Exception:
-            continue
+        if sym in valid_pairs and p is not None:
+            try:
+                lp[sym] = float(p)
+            except Exception:
+                pass
 
-        # discover base/quote purely from symbol by trying every split point
-        for i in range(1, len(sym)):
-            base = sym[:i]
-            quote = sym[i:]
-            if base.isalpha() and quote.isalpha():
-                cq.setdefault(base, set()).add(quote)
-                break
-
+    # 3) Store
     with _cache_lock:
         last_price = lp
         crypto_quotes_map = {b: sorted(list(qs)) for b, qs in cq.items()}
 
     _log("INFO", f"✅ Binance snapshot: {len(last_price)} prices; {len(crypto_quotes_map)} bases")
+
 
 
 def _binance_snapshot_loop():
@@ -240,74 +250,71 @@ prev_rates_intraday: Dict[str, float] = {}
 
 def _fiat_board_loop():
     """
-    Fetch and cache all fiat rates from Frankfurter;
-    keep top-10 daily movers compared to the previous day.
+    Fetch latest USD rates.
+    Compare against previous-day baseline (yesterday or last available trading day).
+    Do NOT reset baseline to today's rates unless the 'date' changes on Frankfurter.
     """
-    global all_fiat_rates, fiat_board_snapshot, last_fiat_rates, daily_baseline
+    global all_fiat_rates, fiat_board_snapshot, daily_baseline
+
+    last_latest_date = None  # Frankfurter 'date' string we last saw
 
     while True:
         try:
-            # --- Fetch today’s USD base rates ---
-            usd_data = http_get_json("https://api.frankfurter.app/latest?from=USD", timeout=10)
-            rates = usd_data.get("rates", {}) or {}
+            latest = http_get_json(f"{EXCHANGE_RATE_API_URL}/latest?from=USD", timeout=10)
+            rates = latest.get("rates", {}) or {}
+            latest_date = latest.get("date")  # e.g. "2025-11-23"
+
             if not rates:
                 raise ValueError("Empty data from Frankfurter")
 
             now = time.time()
-            current_day = time.strftime("%Y-%m-%d", time.gmtime())
 
-            # --- If baseline is empty, try to prime it with yesterday’s data ---
-            if not daily_baseline.get("rates"):
+            # If first run OR Frankfurter date advanced, refresh baseline from previous day
+            if (not daily_baseline.get("rates")) or (latest_date != last_latest_date):
+                # try to pull previous day from Frankfurter
+                from datetime import date, timedelta
+                prev_day = (date.fromisoformat(latest_date) - timedelta(days=1)).isoformat()
+
                 try:
-                    from datetime import date, timedelta
-                    yesterday = (date.today() - timedelta(days=1)).isoformat()
-                    yest_data = http_get_json(f"https://api.frankfurter.app/{yesterday}?from=USD", timeout=10)
-                    yest_rates = yest_data.get("rates", {}) or {}
-                    if yest_rates:
-                        daily_baseline = {
-                            "day": yesterday,
-                            "timestamp": now,
-                            "rates": yest_rates.copy(),
-                        }
-                        _log("INFO", f"🕓 Baseline primed with yesterday’s rates ({yesterday})")
+                    prev = http_get_json(f"{EXCHANGE_RATE_API_URL}/{prev_day}?from=USD", timeout=10)
+                    prev_rates = prev.get("rates", {}) or {}
+                    if not prev_rates:
+                        raise ValueError("prev day empty")
                 except Exception as e:
-                    _log("INFO", f"⚠️ Could not fetch yesterday’s rates: {e}")
+                    _log("INFO", f"⚠️ Could not fetch prev day {prev_day}, using last baseline if any: {e}")
+                    prev_rates = daily_baseline.get("rates") or rates.copy()
 
-            # --- Reset baseline once per new calendar day ---
-            if daily_baseline.get("day") != current_day:
                 daily_baseline = {
-                    "day": current_day,
+                    "day": prev_day,
                     "timestamp": now,
-                    "rates": rates.copy(),
+                    "rates": prev_rates.copy(),
                 }
-                _log("INFO", f"🌅 New daily baseline set for {current_day}")
+                last_latest_date = latest_date
+                _log("INFO", f"🕓 Baseline set to {prev_day} for latest date {latest_date}")
 
-            # --- Compute % change vs. baseline ---
+            # Compute % change vs baseline
             changes = {}
+            base_rates = daily_baseline["rates"]
             for cur, val in rates.items():
-                base_val = daily_baseline["rates"].get(cur, val)
-                if not base_val:
-                    pct = 0.0
-                else:
-                    pct = ((val / base_val) - 1) * 100
-                changes[cur] = {"current": val, "baseline": base_val, "change": pct}
+                base_val = base_rates.get(cur, val)
+                pct = ((val / base_val) - 1) * 100 if base_val else 0.0
+                changes[cur] = {"current": val, "baseline": base_val, "change": pct, "basis": "24h"}
 
-            # --- Select top-10 movers by absolute change ---
+            # Top-10 movers by absolute change
             top10 = sorted(changes.items(), key=lambda kv: abs(kv[1]["change"]), reverse=True)[:10]
             pairs_out = {f"USD_{k}": v for k, v in top10}
 
-            # --- Update caches safely ---
             with _cache_lock:
                 all_fiat_rates = rates.copy()
                 fiat_board_snapshot = {"pairs": pairs_out, "timestamp": now}
 
-            _log("INFO", f"✅ Cached {len(all_fiat_rates)} rates; top-10 movers ready for {current_day}")
+            _log("INFO", f"✅ Cached {len(all_fiat_rates)} rates; top-10 movers ready")
 
         except Exception as e:
             _log("INFO", f"⚠️ Fiat board update failed: {e}")
 
-        # --- Wait until next refresh window ---
         time.sleep(FIAT_REFRESH)
+
 
 
 
