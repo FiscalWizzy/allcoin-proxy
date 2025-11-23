@@ -604,6 +604,8 @@ def _insights_loop():
             blackrock = _get_yahoo_last("BLK")
             crude   = _get_yahoo_last("CL=F")
             gold    = _get_yahoo_last("GC=F")
+            tesla   = _get_yahoo_last("TSLA")
+
 
             snap = {
                 "btc_usd": btc_usd,
@@ -618,6 +620,7 @@ def _insights_loop():
                 "gold": gold,
                 "msft": msft,
                 "blackrock": blackrock,
+                "tesla": tesla,
                 "timestamp": time.time(),
             }
 
