@@ -132,7 +132,14 @@ def _prime_binance_snapshot_once():
     global last_price, crypto_quotes_map
 
     r = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=10)
+    r.raise_for_status()
     data = r.json()
+
+
+    # ✅ Guard against rate-limit / bad responses
+    if not isinstance(data, list):
+        raise ValueError(f"Binance returned non-list payload: {str(data)[:120]}")
+
 
     lp: Dict[str, float] = {}
     cq: Dict[str, set] = {}
@@ -560,7 +567,6 @@ _exchange_cache_ttl = 3600  # 1 hour
 
 
 def _insights_loop():
-    """Fetch BTC, ETH, EUR/USD, and DAX; auto-backoff on errors."""
     global insights_snapshot
     cooldown = 0
     while True:
@@ -570,60 +576,55 @@ def _insights_loop():
                 time.sleep(cooldown)
                 cooldown = 0
 
-            # BTC & ETH
-            btc_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=8)
-            eth_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=8)
-            btc_usd = float(btc_resp.json().get("price", 0))
-            eth_usd = float(eth_resp.json().get("price", 0))
+            btc_usd = float(requests.get(
+                "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+                timeout=8
+            ).json()["price"])
 
-            # EUR/USD (cached call to avoid 429s)
+            eth_usd = float(requests.get(
+                "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT",
+                timeout=8
+            ).json()["price"])
+
             eur_usd = get_exchange_rate_cached("EUR", "USD")
 
-            # Indices & assets from Yahoo
-            dax_val   = _get_yahoo_last("^GDAXI")
-            sp500     = _get_yahoo_last("^GSPC")
-            ftse100   = _get_yahoo_last("^FTSE")
-            apple     = _get_yahoo_last("AAPL")
-            nvda      = _get_yahoo_last("NVDA")
-            msft      = _get_yahoo_last("MSFT")
+            dax_val = _get_yahoo_last("^GDAXI")
+            sp500   = _get_yahoo_last("^GSPC")
+            ftse100 = _get_yahoo_last("^FTSE")
+            apple   = _get_yahoo_last("AAPL")
+            nvda    = _get_yahoo_last("NVDA")
+            msft    = _get_yahoo_last("MSFT")
             blackrock = _get_yahoo_last("BLK")
-            crude     = _get_yahoo_last("CL=F")
-            gold      = _get_yahoo_last("GC=F")
-            tesla     = _get_yahoo_last("TSLA")
+            crude   = _get_yahoo_last("CL=F")
+            gold    = _get_yahoo_last("GC=F")
 
-
-            if not all([btc_usd, eth_usd, eur_usd, dax_val]):
-                raise ValueError("One or more core warm-up values are missing")
-
-            with _cache_lock:
-                insights_snapshot = {
-                    "btc_usd": btc_usd,
-                    "eth_usd": eth_usd,
-                    "eur_usd": eur_usd,
-                    "dax": dax_val,
-                    "sp500": sp500,
-                    "ftse100": ftse100,
-                    "apple": apple,
-                    "nvda": nvda,
-                    "crude": crude,
-                    "gold": gold,
-                    "msft": msft,
-                    "blackrock": blackrock,
-                    "tesla": tesla,
-                    "timestamp": time.time(),
-
-                }
-
+            snap = {
+                "btc_usd": btc_usd,
+                "eth_usd": eth_usd,
+                "eur_usd": eur_usd,
+                "dax": dax_val,
+                "sp500": sp500,
+                "ftse100": ftse100,
+                "apple": apple,
+                "nvda": nvda,
+                "crude": crude,
+                "gold": gold,
+                "msft": msft,
+                "blackrock": blackrock,
+                "timestamp": time.time(),
+            }
 
             with _cache_lock:
                 insights_snapshot = snap
-            _log("INFO", f"✅ Insights updated: {snap}")
+
+            _log("INFO", f"✅ Insights updated")
 
         except Exception as e:
             _log("INFO", f"⚠️ Insights update failed: {e}")
-            cooldown = 60  # wait a bit if error
+            cooldown = 60
 
         time.sleep(INSIGHTS_REFRESH)
+
 
 
 def _get_yahoo_last(symbol: str) -> Optional[float]:
