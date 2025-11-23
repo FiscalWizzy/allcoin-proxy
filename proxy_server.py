@@ -127,49 +127,51 @@ def get_crypto_price(symbol: str) -> float | None:
         _log("INFO", f"⚠️ get_crypto_price failed for {symbol}: {e}")
         return None
 
-def _binance_snapshot_loop():
-    """Periodically fetch all ticker prices and build crypto_quotes_map from real Binance symbols."""
+def _prime_binance_snapshot_once():
+    """Fetch all Binance tickers once and build crypto_quotes_map + last_price."""
     global last_price, crypto_quotes_map
-    interval = 180  # 3 min; adjust later
 
+    r = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=10)
+    data = r.json()
+
+    lp: Dict[str, float] = {}
+    cq: Dict[str, set] = {}
+
+    for item in data:
+        sym = item.get("symbol", "")
+        p = item.get("price")
+        if not sym or p is None:
+            continue
+        try:
+            lp[sym] = float(p)
+        except Exception:
+            continue
+
+        # discover base/quote purely from symbol by trying every split point
+        for i in range(1, len(sym)):
+            base = sym[:i]
+            quote = sym[i:]
+            if base.isalpha() and quote.isalpha():
+                cq.setdefault(base, set()).add(quote)
+                break
+
+    with _cache_lock:
+        last_price = lp
+        crypto_quotes_map = {b: sorted(list(qs)) for b, qs in cq.items()}
+
+    _log("INFO", f"✅ Binance snapshot: {len(last_price)} prices; {len(crypto_quotes_map)} bases")
+
+
+def _binance_snapshot_loop():
+    """Periodic refresh of Binance snapshot."""
+    interval = 180  # 3 min
     while True:
         try:
-            r = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=10)
-            data = r.json()
-
-            lp: Dict[str, float] = {}
-            cq: Dict[str, set] = {}
-
-            for item in data:
-                sym = item.get("symbol", "")
-                p = item.get("price")
-                if not sym or p is None:
-                    continue
-                try:
-                    lp[sym] = float(p)
-                except:
-                    continue
-
-                # discover base/quote purely from symbol by trying every split point
-                # (e.g., ETHBTC -> ETH/BTC, BTCEUR -> BTC/EUR, ARBETH -> ARB/ETH)
-                # keep ONLY splits where both parts are alphabetic
-                for i in range(1, len(sym)):  # split between i-1|i
-                    base = sym[:i]
-                    quote = sym[i:]
-                    if base.isalpha() and quote.isalpha():
-                        cq.setdefault(base, set()).add(quote)
-                        break  # first plausible split is enough for Binance symbols
-
-            with _cache_lock:
-                last_price = lp
-                crypto_quotes_map = {b: sorted(list(qs)) for b, qs in cq.items()}
-
-            _log("INFO", f"✅ Binance snapshot: {len(last_price)} prices; {len(crypto_quotes_map)} bases")
-
+            _prime_binance_snapshot_once()
         except Exception as e:
             _log("INFO", f"⚠️ _binance_snapshot_loop failed: {e}")
-
         time.sleep(interval)
+
 
 
 # -------------
@@ -328,22 +330,21 @@ def warmup_insights():
             # EUR/USD (cached call to avoid 429s)
             eur_usd = get_exchange_rate_cached("EUR", "USD")
 
-            # DAX (Yahoo)
-            headers = {"User-Agent": "Mozilla/5.0"}
-            dax_resp = requests.get(
-                "https://query1.finance.yahoo.com/v8/finance/chart/%5EGDAXI",
-                params={"interval": "1h"},
-                headers=headers,
-                timeout=8,
-            )
-            dax_json = dax_resp.json()
-            dax_val = (
-                dax_json.get("chart", {}).get("result", [{}])[0]
-                .get("meta", {}).get("regularMarketPrice")
-            )
+            # Indices & assets from Yahoo
+            dax_val   = _get_yahoo_last("^GDAXI")
+            sp500     = _get_yahoo_last("^GSPC")
+            ftse100   = _get_yahoo_last("^FTSE")
+            apple     = _get_yahoo_last("AAPL")
+            nvda      = _get_yahoo_last("NVDA")
+            msft      = _get_yahoo_last("MSFT")
+            blackrock = _get_yahoo_last("BLK")
+            crude     = _get_yahoo_last("CL=F")
+            gold      = _get_yahoo_last("GC=F")
+            tesla     = _get_yahoo_last("TSLA")
+
 
             if not all([btc_usd, eth_usd, eur_usd, dax_val]):
-                raise ValueError("One or more warm-up values are missing")
+                raise ValueError("One or more core warm-up values are missing")
 
             with _cache_lock:
                 insights_snapshot = {
@@ -351,8 +352,18 @@ def warmup_insights():
                     "eth_usd": eth_usd,
                     "eur_usd": eur_usd,
                     "dax": dax_val,
+                    "sp500": sp500,
+                    "ftse100": ftse100,
+                    "apple": apple,
+                    "nvda": nvda,
+                    "crude": crude,
+                    "gold": gold,
+                    "msft": msft,
+                    "blackrock": blackrock,
+                    "tesla": tesla,
                     "timestamp": time.time(),
                 }
+
 
             _log("INFO", f"✅ Warm-up complete — BTC={btc_usd}, ETH={eth_usd}, EUR/USD={eur_usd}, DAX={dax_val}")
             break  # ✅ success → stop retrying
@@ -559,36 +570,50 @@ def _insights_loop():
                 time.sleep(cooldown)
                 cooldown = 0
 
-            # --- BTC & ETH from Binance ---
+            # BTC & ETH
             btc_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=8)
             eth_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=8)
-            btc_usd = float(btc_resp.json()["price"])
-            eth_usd = float(eth_resp.json()["price"])
+            btc_usd = float(btc_resp.json().get("price", 0))
+            eth_usd = float(eth_resp.json().get("price", 0))
 
-            # --- EUR/USD via Frankfurter (cached hourly) ---
+            # EUR/USD (cached call to avoid 429s)
             eur_usd = get_exchange_rate_cached("EUR", "USD")
 
-            # --- DAX from Yahoo Finance ---
-            headers = {"User-Agent": "Mozilla/5.0"}
-            dax_resp = requests.get(
-                "https://query1.finance.yahoo.com/v8/finance/chart/%5EGDAXI",
-                params={"interval": "1h"},
-                headers=headers,
-                timeout=8,
-            )
-            dax_json = dax_resp.json()
-            dax_val = (
-                dax_json.get("chart", {}).get("result", [{}])[0]
-                .get("meta", {}).get("regularMarketPrice")
-            )
+            # Indices & assets from Yahoo
+            dax_val   = _get_yahoo_last("^GDAXI")
+            sp500     = _get_yahoo_last("^GSPC")
+            ftse100   = _get_yahoo_last("^FTSE")
+            apple     = _get_yahoo_last("AAPL")
+            nvda      = _get_yahoo_last("NVDA")
+            msft      = _get_yahoo_last("MSFT")
+            blackrock = _get_yahoo_last("BLK")
+            crude     = _get_yahoo_last("CL=F")
+            gold      = _get_yahoo_last("GC=F")
+            tesla     = _get_yahoo_last("TSLA")
 
-            snap = {
-                "btc_usd": btc_usd,
-                "eth_usd": eth_usd,
-                "eur_usd": eur_usd,
-                "dax": dax_val,
-                "timestamp": time.time(),
-            }
+
+            if not all([btc_usd, eth_usd, eur_usd, dax_val]):
+                raise ValueError("One or more core warm-up values are missing")
+
+            with _cache_lock:
+                insights_snapshot = {
+                    "btc_usd": btc_usd,
+                    "eth_usd": eth_usd,
+                    "eur_usd": eur_usd,
+                    "dax": dax_val,
+                    "sp500": sp500,
+                    "ftse100": ftse100,
+                    "apple": apple,
+                    "nvda": nvda,
+                    "crude": crude,
+                    "gold": gold,
+                    "msft": msft,
+                    "blackrock": blackrock,
+                    "tesla": tesla,
+                    "timestamp": time.time(),
+
+                }
+
 
             with _cache_lock:
                 insights_snapshot = snap
@@ -600,6 +625,26 @@ def _insights_loop():
 
         time.sleep(INSIGHTS_REFRESH)
 
+
+def _get_yahoo_last(symbol: str) -> Optional[float]:
+    """Fetch last price for a Yahoo Finance symbol (e.g. ^GSPC, AAPL, CL=F)."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        params={"interval": "1h"},
+        headers=headers,
+        timeout=8,
+    )
+    j = r.json()
+    try:
+        return (
+            j.get("chart", {})
+             .get("result", [{}])[0]
+             .get("meta", {})
+             .get("regularMarketPrice")
+        )
+    except Exception:
+        return None
 
 
 # -----------
@@ -656,23 +701,40 @@ def fiats():
 def _ensure_bg():
     ensure_background_threads()
 
+
 @app.route("/crypto-bases")
 def crypto_bases():
     """List all available crypto base symbols."""
+    ensure_background_threads()
+
+    # If the universe is empty, try a one-shot prime
+    with _cache_lock:
+        empty = not bool(crypto_quotes_map)
+
+    if empty:
+        try:
+            _prime_binance_snapshot_once()
+        except Exception as e:
+            return jsonify({"bases": [], "error": f"warmup failed: {e}"}), 503
+
     with _cache_lock:
         bases = sorted(list(crypto_quotes_map.keys()))
     return jsonify({"bases": bases, "timestamp": time.time()})
 
 
+
 @app.route("/crypto-quotes")
 def crypto_quotes():
     """List valid quote symbols for a given base."""
+    ensure_background_threads()
+
     base = (request.args.get("base") or "").upper()
     with _cache_lock:
         quotes = crypto_quotes_map.get(base, [])
     if not quotes:
         return jsonify({"base": base, "quotes": [], "error": "unknown base"}), 404
     return jsonify({"base": base, "quotes": quotes, "timestamp": time.time()})
+
 
 
 @app.route("/cryptos")
