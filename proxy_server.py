@@ -813,6 +813,9 @@ def convert():
         crypto_quotes_set = set(q for qs in crypto_quotes_map.values() for q in qs)
     crypto_symbols = crypto_bases_set | crypto_quotes_set
 
+    # ✅ Fiat universe from Frankfurter cache (+ USD)
+    with _cache_lock:
+        fiat_symbols = set(all_fiat_rates.keys()) | {"USD"}
 
     # Helper: fetch crypto price from Binance
     def get_crypto_price(symbol: str) -> float | None:
@@ -825,8 +828,10 @@ def convert():
             _log("INFO", f"⚠️ get_crypto_price failed: {e}")
         return None
 
-    # ✅ Case 1: crypto involved
-    if from_cur in crypto_symbols or to_cur in crypto_symbols:
+    # ✅ Case 1: crypto involved (BUT NOT pure fiat)
+    if (from_cur in crypto_symbols or to_cur in crypto_symbols) and not (
+        from_cur in fiat_symbols and to_cur in fiat_symbols
+    ):
         try:
             # Direct pair attempt
             direct = get_crypto_price(f"{from_cur}{to_cur}")
@@ -905,6 +910,12 @@ def convert():
     if from_cur == to_cur:
         return jsonify({"from": from_cur, "to": to_cur,
                         "amount": amount, "converted": amount})
+
+    if from_cur != "USD" and from_cur not in rates:
+        return jsonify({"error": f"Unknown fiat: {from_cur}"}), 400
+    if to_cur != "USD" and to_cur not in rates:
+        return jsonify({"error": f"Unknown fiat: {to_cur}"}), 400
+
 
     # Reconstruct via USD (Frankfurter format)
     base_to_usd = 1.0 if from_cur == "USD" else (1 / rates.get(from_cur, 1))
