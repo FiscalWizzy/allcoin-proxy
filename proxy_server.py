@@ -355,6 +355,8 @@ def warmup_insights():
             crude     = _get_yahoo_last("CL=F")
             gold      = _get_yahoo_last("GC=F")
             tesla     = _get_yahoo_last("TSLA")
+            palantir  = _get_yahoo_last("PLTR")
+
 
 
             if not all([btc_usd, eth_usd, eur_usd, dax_val]):
@@ -375,6 +377,7 @@ def warmup_insights():
                     "msft": msft,
                     "blackrock": blackrock,
                     "tesla": tesla,
+                    "palantir": palantir,
                     "timestamp": time.time(),
                 }
 
@@ -605,6 +608,8 @@ def _insights_loop():
             crude   = _get_yahoo_last("CL=F")
             gold    = _get_yahoo_last("GC=F")
             tesla   = _get_yahoo_last("TSLA")
+            palantir = _get_yahoo_last("PLTR")
+
 
 
             snap = {
@@ -621,6 +626,7 @@ def _insights_loop():
                 "msft": msft,
                 "blackrock": blackrock,
                 "tesla": tesla,
+                "palantir": palantir,
                 "timestamp": time.time(),
             }
 
