@@ -189,6 +189,20 @@ def _binance_snapshot_loop():
             _log("INFO", f"⚠️ _binance_snapshot_loop failed: {e}")
         time.sleep(interval)
 
+def _binance_24h(symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Returns (last_price, pct_change_24h) from Binance ticker/24hr.
+    """
+    try:
+        url = f"{BINANCE_API}/api/v3/ticker/24hr"
+        r = requests.get(url, params={"symbol": symbol.upper()}, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        last_price = float(j.get("lastPrice")) if j.get("lastPrice") else None
+        pct = float(j.get("priceChangePercent")) if j.get("priceChangePercent") else None
+        return last_price, pct
+    except Exception:
+        return None, None
 
 
 # -------------
@@ -218,7 +232,7 @@ def _save_cache():
                 json.dump(fiat_board_snapshot, f, indent=None, separators=(',', ':'))
 
             with open(INSIGHTS_FILE, "w") as f:
-                json.dump(insights_snapshot, f, indent=None, separators=(',', ':'))
+                json.dump(t, f, indent=None, separators=(',', ':'))
 
             _log("INFO", "💾 Cache saved successfully (compact mode, no chart cache).")
         except Exception as e:
@@ -335,66 +349,101 @@ def warmup_insights():
         try:
             _log("INFO", "⚡ Running startup warm-up for insights…")
 
-            # BTC & ETH
-            btc_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=8)
-            eth_resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=8)
-            btc_usd = float(btc_resp.json().get("price", 0))
-            eth_usd = float(eth_resp.json().get("price", 0))
+            # --- Crypto (Binance 24h) ---
+            btc_usd, btc_chg = _binance_24h("BTCUSDT")
+            eth_usd, eth_chg = _binance_24h("ETHUSDT")
 
-            # EUR/USD (cached call to avoid 429s)
+            # --- EUR/USD (use your existing cached helper) ---
+            # If you prefer the "safe EUR/USD" version, tell me and I’ll paste it here.
             eur_usd = get_exchange_rate_cached("EUR", "USD")
 
-            # Indices & assets from Yahoo
-            dax_val   = _get_yahoo_last("^GDAXI")
-            sp500     = _get_yahoo_last("^GSPC")
-            ftse100   = _get_yahoo_last("^FTSE")
-            apple     = _get_yahoo_last("AAPL")
-            nvda      = _get_yahoo_last("NVDA")
-            msft      = _get_yahoo_last("MSFT")
-            blackrock = _get_yahoo_last("BLK")
-            crude     = _get_yahoo_last("CL=F")
-            gold      = _get_yahoo_last("GC=F")
-            tesla     = _get_yahoo_last("TSLA")
-            palantir  = _get_yahoo_last("PLTR")
-            # --- Extra watchlist (materials + AI supply chain + China + Gemini stock) ---
+            # --- Core indices & assets from Yahoo (price + % vs prev close) ---
+            dax_val, dax_chg = _get_yahoo_price_and_change("^GDAXI")
+            sp500_val, sp500_chg = _get_yahoo_price_and_change("^GSPC")
+            ftse100_val, ftse100_chg = _get_yahoo_price_and_change("^FTSE")
+
+            apple, apple_chg = _get_yahoo_price_and_change("AAPL")
+            nvda, nvda_chg = _get_yahoo_price_and_change("NVDA")
+            msft, msft_chg = _get_yahoo_price_and_change("MSFT")
+            blackrock, blackrock_chg = _get_yahoo_price_and_change("BLK")
+
+            crude, crude_chg = _get_yahoo_price_and_change("CL=F")
+            gold, gold_chg = _get_yahoo_price_and_change("GC=F")
+
+            tesla, tesla_chg = _get_yahoo_price_and_change("TSLA")
+            palantir, palantir_chg = _get_yahoo_price_and_change("PLTR")
+
+            # --- Extra watchlist (looped keys: key + key_chg) ---
             extra = {}
+            extra_chg = {}
             for key, sym in YAHOO_WATCHLIST.items():
-                extra[key] = _get_yahoo_last(sym)
+                p, c = _get_yahoo_price_and_change(sym)
+                extra[key] = p
+                extra_chg[f"{key}_chg"] = c
 
-
-
-
-            if not all([btc_usd, eth_usd, eur_usd, dax_val]):
-                raise ValueError("One or more core warm-up values are missing")
+            # If you're still using the "strict warmup", keep it.
+            # I recommend only requiring BTC/ETH so warmup never blocks forever.
+            if not btc_usd or not eth_usd:
+                raise ValueError("Core warm-up values missing (BTC/ETH)")
 
             with _cache_lock:
                 insights_snapshot = {
+                    # prices
                     "btc_usd": btc_usd,
                     "eth_usd": eth_usd,
                     "eur_usd": eur_usd,
+
                     "dax": dax_val,
-                    "sp500": sp500,
-                    "ftse100": ftse100,
+                    "sp500": sp500_val,
+                    "ftse100": ftse100_val,
+
                     "apple": apple,
                     "nvda": nvda,
-                    "crude": crude,
-                    "gold": gold,
                     "msft": msft,
                     "blackrock": blackrock,
+
+                    "crude": crude,
+                    "gold": gold,
+
                     "tesla": tesla,
                     "palantir": palantir,
+
+                    # % changes
+                    "btc_chg": btc_chg,
+                    "eth_chg": eth_chg,
+
+                    "dax_chg": dax_chg,
+                    "sp500_chg": sp500_chg,
+                    "ftse100_chg": ftse100_chg,
+
+                    "apple_chg": apple_chg,
+                    "nvda_chg": nvda_chg,
+                    "msft_chg": msft_chg,
+                    "blackrock_chg": blackrock_chg,
+
+                    "crude_chg": crude_chg,
+                    "gold_chg": gold_chg,
+
+                    "tesla_chg": tesla_chg,
+                    "palantir_chg": palantir_chg,
+
+                    # extras
                     **extra,
+                    **extra_chg,
 
                     "timestamp": time.time(),
                 }
 
-
-            _log("INFO", f"✅ Warm-up complete — BTC={btc_usd}, ETH={eth_usd}, EUR/USD={eur_usd}, DAX={dax_val}")
+            _log(
+                "INFO",
+                f"✅ Warm-up complete — BTC={btc_usd} ({btc_chg}%), ETH={eth_usd} ({eth_chg}%), EUR/USD={eur_usd}, DAX={dax_val} ({dax_chg}%)"
+            )
             break  # ✅ success → stop retrying
 
         except Exception as e:
             _log("INFO", f"⚠️ Warm-up failed: {e} — retrying in {retry_delay}s")
             time.sleep(retry_delay)
+
 
 
 def warmup_fiat_board():
@@ -586,6 +635,7 @@ _exchange_cache_ttl = 3600  # 1 hour
 def _insights_loop():
     global insights_snapshot
     cooldown = 0
+
     while True:
         try:
             if cooldown > 0:
@@ -593,66 +643,95 @@ def _insights_loop():
                 time.sleep(cooldown)
                 cooldown = 0
 
-            btc_usd = float(requests.get(
-                "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-                timeout=8
-            ).json()["price"])
+            # --- Crypto (Binance 24h) ---
+            btc_usd, btc_chg = _binance_24h("BTCUSDT")
+            eth_usd, eth_chg = _binance_24h("ETHUSDT")
 
-            eth_usd = float(requests.get(
-                "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT",
-                timeout=8
-            ).json()["price"])
-
+            # --- EUR/USD ---
             eur_usd = get_exchange_rate_cached("EUR", "USD")
 
-            dax_val = _get_yahoo_last("^GDAXI")
-            sp500   = _get_yahoo_last("^GSPC")
-            ftse100 = _get_yahoo_last("^FTSE")
-            apple   = _get_yahoo_last("AAPL")
-            nvda    = _get_yahoo_last("NVDA")
-            msft    = _get_yahoo_last("MSFT")
-            blackrock = _get_yahoo_last("BLK")
-            crude   = _get_yahoo_last("CL=F")
-            gold    = _get_yahoo_last("GC=F")
-            tesla   = _get_yahoo_last("TSLA")
-            palantir = _get_yahoo_last("PLTR")
-            # --- Extra watchlist refresh ---
+            # --- Yahoo (price + % vs prev close) ---
+            dax_val, dax_chg = _get_yahoo_price_and_change("^GDAXI")
+            sp500_val, sp500_chg = _get_yahoo_price_and_change("^GSPC")
+            ftse100_val, ftse100_chg = _get_yahoo_price_and_change("^FTSE")
+
+            apple, apple_chg = _get_yahoo_price_and_change("AAPL")
+            nvda, nvda_chg = _get_yahoo_price_and_change("NVDA")
+            msft, msft_chg = _get_yahoo_price_and_change("MSFT")
+            blackrock, blackrock_chg = _get_yahoo_price_and_change("BLK")
+
+            crude, crude_chg = _get_yahoo_price_and_change("CL=F")
+            gold, gold_chg = _get_yahoo_price_and_change("GC=F")
+
+            tesla, tesla_chg = _get_yahoo_price_and_change("TSLA")
+            palantir, palantir_chg = _get_yahoo_price_and_change("PLTR")
+
+            # --- Extras ---
             extra = {}
+            extra_chg = {}
             for key, sym in YAHOO_WATCHLIST.items():
-                extra[key] = _get_yahoo_last(sym)
-
-
-
+                p, c = _get_yahoo_price_and_change(sym)
+                extra[key] = p
+                extra_chg[f"{key}_chg"] = c
 
             snap = {
+                # prices
                 "btc_usd": btc_usd,
                 "eth_usd": eth_usd,
                 "eur_usd": eur_usd,
+
                 "dax": dax_val,
-                "sp500": sp500,
-                "ftse100": ftse100,
+                "sp500": sp500_val,
+                "ftse100": ftse100_val,
+
                 "apple": apple,
                 "nvda": nvda,
-                "crude": crude,
-                "gold": gold,
                 "msft": msft,
                 "blackrock": blackrock,
+
+                "crude": crude,
+                "gold": gold,
+
                 "tesla": tesla,
                 "palantir": palantir,
+
+                # % changes
+                "btc_chg": btc_chg,
+                "eth_chg": eth_chg,
+
+                "dax_chg": dax_chg,
+                "sp500_chg": sp500_chg,
+                "ftse100_chg": ftse100_chg,
+
+                "apple_chg": apple_chg,
+                "nvda_chg": nvda_chg,
+                "msft_chg": msft_chg,
+                "blackrock_chg": blackrock_chg,
+
+                "crude_chg": crude_chg,
+                "gold_chg": gold_chg,
+
+                "tesla_chg": tesla_chg,
+                "palantir_chg": palantir_chg,
+
+                # extras
                 **extra,
+                **extra_chg,
+
                 "timestamp": time.time(),
             }
 
             with _cache_lock:
                 insights_snapshot = snap
 
-            _log("INFO", f"✅ Insights updated")
+            _log("INFO", "✅ Insights updated (price + % change)")
 
         except Exception as e:
             _log("INFO", f"⚠️ Insights update failed: {e}")
             cooldown = 60
 
         time.sleep(INSIGHTS_REFRESH)
+
 
 # --- Extra AI/tech + materials watchlist (Yahoo symbols) ---
 YAHOO_WATCHLIST = {
@@ -705,6 +784,44 @@ def _get_yahoo_last(symbol: str) -> Optional[float]:
         )
     except Exception:
         return None
+
+def _get_yahoo_price_and_change(symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Returns:
+      (price, pct_change)
+    pct_change is computed vs previous close if available.
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        params={"interval": "1d", "range": "5d"},
+        headers=headers,
+        timeout=8,
+    )
+    j = r.json()
+
+    try:
+        result = j.get("chart", {}).get("result", [{}])[0]
+        meta = result.get("meta", {}) or {}
+
+        price = meta.get("regularMarketPrice")
+        prev = meta.get("previousClose")
+
+        # Some tickers use different meta fields sometimes
+        if prev is None:
+            prev = meta.get("chartPreviousClose")
+
+        if price is None:
+            return None, None
+
+        pct = None
+        if prev not in (None, 0):
+            pct = ((float(price) / float(prev)) - 1.0) * 100.0
+
+        return float(price), (float(pct) if pct is not None else None)
+
+    except Exception:
+        return None, None
 
 
 # -----------
