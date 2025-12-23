@@ -356,6 +356,11 @@ def warmup_insights():
             gold      = _get_yahoo_last("GC=F")
             tesla     = _get_yahoo_last("TSLA")
             palantir  = _get_yahoo_last("PLTR")
+            # --- Extra watchlist (materials + AI supply chain + China + Gemini stock) ---
+            extra = {}
+            for key, sym in YAHOO_WATCHLIST.items():
+                extra[key] = _get_yahoo_last(sym)
+
 
 
 
@@ -378,6 +383,8 @@ def warmup_insights():
                     "blackrock": blackrock,
                     "tesla": tesla,
                     "palantir": palantir,
+                    **extra,
+
                     "timestamp": time.time(),
                 }
 
@@ -609,6 +616,11 @@ def _insights_loop():
             gold    = _get_yahoo_last("GC=F")
             tesla   = _get_yahoo_last("TSLA")
             palantir = _get_yahoo_last("PLTR")
+            # --- Extra watchlist refresh ---
+            extra = {}
+            for key, sym in YAHOO_WATCHLIST.items():
+                extra[key] = _get_yahoo_last(sym)
+
 
 
 
@@ -627,6 +639,7 @@ def _insights_loop():
                 "blackrock": blackrock,
                 "tesla": tesla,
                 "palantir": palantir,
+                **extra,
                 "timestamp": time.time(),
             }
 
@@ -641,6 +654,36 @@ def _insights_loop():
 
         time.sleep(INSIGHTS_REFRESH)
 
+# --- Extra AI/tech + materials watchlist (Yahoo symbols) ---
+YAHOO_WATCHLIST = {
+    # Metals / materials influencing tech
+    "copper":   "HG=F",
+    "silver":   "SI=F",
+    "palladium":"PA=F",
+    "platinum": "PL=F",
+    "rare_earth_etf": "REMX",
+
+    # “Gemini stock” (Alphabet / Google)
+    "googl": "GOOGL",
+
+    # US AI / chip supply chain
+    "meta": "META",
+    "amzn": "AMZN",
+    "asml": "ASML",
+    "tsm":  "TSM",
+    "amd":  "AMD",
+    "avgo": "AVGO",
+    "smci": "SMCI",
+    "snow": "SNOW",
+
+    # China / ADRs that matter for tech + AI
+    "baba":  "BABA",
+    "tcehy": "TCEHY",
+    "bidu":  "BIDU",
+    "smic":  "SMICY",  # SMIC ADR (often more stable than HK symbol formatting)
+    "nio":   "NIO",
+    "byd":   "BYDDY",  # BYD ADR (HK ticker formatting can be annoying)
+}
 
 
 def _get_yahoo_last(symbol: str) -> Optional[float]:
