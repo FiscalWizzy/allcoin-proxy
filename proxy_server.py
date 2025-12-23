@@ -680,7 +680,7 @@ YAHOO_WATCHLIST = {
     "baba":  "BABA",
     "tcehy": "TCEHY",
     "bidu":  "BIDU",
-    "smic":  "SMICY",  # SMIC ADR (often more stable than HK symbol formatting)
+    "smic": "0981.HK",  # SMIC ADR (often more stable than HK symbol formatting)
     "nio":   "NIO",
     "byd":   "BYDDY",  # BYD ADR (HK ticker formatting can be annoying)
 }
