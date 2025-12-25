@@ -5,7 +5,7 @@ import threading
 import feedparser
 import random
 from typing import Dict, Tuple, List, Optional
-
+from collections import deque
 import requests
 from flask import Flask, request, jsonify
 
@@ -46,6 +46,15 @@ FIAT_REFRESH = 1800  # 30 min
 
 # Insights cadence (seconds)
 INSIGHTS_REFRESH = 1800 # 30 min
+
+# --- Sparkline series config (24h) ---
+INSIGHTS_SERIES_WINDOW_SEC = 24 * 3600
+INSIGHTS_SERIES_POINTS = int(INSIGHTS_SERIES_WINDOW_SEC / INSIGHTS_REFRESH)  # 48 if refresh=1800
+
+
+insights_series = {}  # key -> deque([(ts, val), ...], maxlen=INSIGHTS_SERIES_POINTS)
+SERIES_FILE = os.path.join(DATA_DIR, "insights_series.json")
+
 
 _threads_started = False
 STRICT_CACHE_ONLY = True  # do not hit Binance inside request handler
@@ -234,6 +243,17 @@ def _save_cache():
             with open(INSIGHTS_FILE, "w") as f:
                 json.dump(t, f, indent=None, separators=(',', ':'))
 
+                        # Save insights series
+            with _cache_lock:
+                series_payload = {
+                    "points": INSIGHTS_SERIES_POINTS,
+                    "refresh": INSIGHTS_REFRESH,
+                    "saved_at": time.time(),
+                    "series": {k: list(dq) for k, dq in insights_series.items() if dq}
+                }
+            with open(SERIES_FILE, "w") as f:
+                json.dump(series_payload, f, indent=None, separators=(',', ':'))
+
             _log("INFO", "💾 Cache saved successfully (compact mode, no chart cache).")
         except Exception as e:
             _log("INFO", f"⚠️ Cache save failed: {e}")
@@ -250,6 +270,26 @@ def _load_cache():
         if os.path.exists(INSIGHTS_FILE):
             with open(INSIGHTS_FILE, "r") as f:
                 insights_snapshot = json.load(f)
+
+                # Load insights series
+        global insights_series
+        if os.path.exists(SERIES_FILE):
+            with open(SERIES_FILE, "r") as f:
+                raw = json.load(f) or {}
+            loaded = {}
+            series = raw.get("series", {}) or {}
+            for k, arr in series.items():
+                if isinstance(arr, list):
+                    dq = deque(maxlen=INSIGHTS_SERIES_POINTS)
+                    # arr elements are [ts, val]
+                    for pt in arr:
+                        if isinstance(pt, (list, tuple)) and len(pt) == 2:
+                            dq.append([float(pt[0]), float(pt[1])])
+                    if dq:
+                        loaded[k] = dq
+            with _cache_lock:
+                insights_series = loaded
+            _log("INFO", f"♻️ Loaded insights_series for {len(insights_series)} keys")
 
         _log("INFO", "♻️ Cache restored from disk (fiat + insights only).")
     except Exception as e:
@@ -433,6 +473,13 @@ def warmup_insights():
 
                     "timestamp": time.time(),
                 }
+
+                ts = time.time()
+                # seed series with warmup snapshot as a point
+                for k, v in insights_snapshot.items():
+                    if k == "timestamp":
+                        continue
+                    _append_series_point(k, ts, v)
 
             _log(
                 "INFO",
@@ -822,6 +869,22 @@ def _get_yahoo_price_and_change(symbol: str) -> Tuple[Optional[float], Optional[
 
     except Exception:
         return None, None
+
+
+def _append_series_point(key: str, ts: float, val: Optional[float]):
+    if val is None:
+        return
+    try:
+        v = float(val)
+    except Exception:
+        return
+
+    with _cache_lock:
+        dq = insights_series.get(key)
+        if dq is None:
+            dq = deque(maxlen=INSIGHTS_SERIES_POINTS)
+            insights_series[key] = dq
+        dq.append([ts, v])  # store as [ts, v] for JSON friendliness
 
 
 # -----------
