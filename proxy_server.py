@@ -51,14 +51,6 @@ INSIGHTS_REFRESH = 1800 # 30 min
 INSIGHTS_SERIES_WINDOW_SEC = 24 * 3600
 INSIGHTS_SERIES_POINTS = int(INSIGHTS_SERIES_WINDOW_SEC / INSIGHTS_REFRESH)  # 48 if refresh=1800
 
-
-insights_series = {}  # key -> deque([(ts, val), ...], maxlen=INSIGHTS_SERIES_POINTS)
-SERIES_FILE = os.path.join(DATA_DIR, "insights_series.json")
-
-
-_threads_started = False
-STRICT_CACHE_ONLY = True  # do not hit Binance inside request handler
-
 # -----------------------
 # Persistence paths
 # -----------------------
@@ -67,6 +59,13 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 FIAT_FILE = os.path.join(DATA_DIR, "fiat.json")
 INSIGHTS_FILE = os.path.join(DATA_DIR, "insights.json")
+insights_series = {}  # key -> deque([(ts, val), ...], maxlen=INSIGHTS_SERIES_POINTS)
+SERIES_FILE = os.path.join(DATA_DIR, "insights_series.json")
+
+
+_threads_started = False
+STRICT_CACHE_ONLY = True  # do not hit Binance inside request handler
+
 
 all_fiat_rates: dict = {}
 # dynamic crypto universe (built from Binance snapshot)
