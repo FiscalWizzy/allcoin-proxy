@@ -215,7 +215,7 @@ def _binance_24h(symbol: str) -> Tuple[Optional[float], Optional[float]]:
 # -------------
 # In-memory cache
 # -------------
-_cache_lock = threading.Lock()
+_cache_lock = threading.RLock()
 
 # last trade price cache: last_price[symbol] = float
 last_price: Dict[str, float] = {}
@@ -875,40 +875,6 @@ def _get_yahoo_price_and_change(symbol: str) -> Tuple[Optional[float], Optional[
         return None, None
 
 
-def seed_sparklines_from_server():
-    """Fetch last 24h series from backend and seed spark_history + widgets."""
-    try:
-        # ask for all series the server has (or limit to keys in snapshot_widgets)
-        keys = ",".join(snapshot_widgets.keys())
-        url = f"{BASE_URL}/insights-series"
-        resp = requests.get(url, params={"keys": keys}, timeout=12)
-        if resp.status_code != 200:
-            print("⚠️ /insights-series failed:", resp.text)
-            return
-        j = resp.json()
-        series = j.get("series", {}) or {}
-
-        # series[k] is [[ts, val], ...]
-        for k, arr in series.items():
-            if not isinstance(arr, list) or not arr:
-                continue
-            dq = deque(maxlen=SPARK_POINTS)  # set SPARK_POINTS = 48 for 24h
-            for pt in arr:
-                if isinstance(pt, (list, tuple)) and len(pt) == 2:
-                    dq.append(float(pt[1]))
-            spark_history[k] = dq
-
-        # push into widgets immediately (neutral color until first chg update)
-        for k, w in snapshot_widgets.items():
-            dq = spark_history.get(k)
-            if dq and w.get("spark"):
-                w["spark"].set_series(list(dq), "#AAAAAA")
-
-        print(f"✅ Seeded sparklines for {len(series)} keys")
-
-    except Exception as e:
-        print("⚠️ seed_sparklines_from_server failed:", e)
-
 
 
 def _append_series_point(key: str, ts: float, val: Optional[float]):
@@ -1073,24 +1039,21 @@ def insights():
 def insights_series_route():
     ensure_background_threads()
 
-    keys_param = request.args.get("keys", "").strip()
+    keys_param = (request.args.get("keys") or "").strip()
     points_req = request.args.get("points", type=int)
 
-    # default keys: all we have
+    # enforce sane bounds
+    default_points = INSIGHTS_SERIES_POINTS
+    points = default_points if points_req is None else max(4, min(points_req, default_points))
+
     with _cache_lock:
         available_keys = list(insights_series.keys()) if insights_series else []
 
+    # If client provided keys, filter. Otherwise return all we have.
     if keys_param:
         keys = [k.strip() for k in keys_param.split(",") if k.strip()]
     else:
         keys = available_keys
-
-    # enforce sane bounds (prevents abuse)
-    default_points = INSIGHTS_SERIES_POINTS
-    if points_req is None:
-        points = default_points
-    else:
-        points = max(4, min(points_req, default_points))
 
     out = {}
     with _cache_lock:
@@ -1098,9 +1061,7 @@ def insights_series_route():
             dq = insights_series.get(k)
             if not dq:
                 continue
-            # take last N points
-            arr = list(dq)[-points:]
-            out[k] = arr
+            out[k] = list(dq)[-points:]  # each point is [ts, val]
 
     return jsonify({
         "points": points,
@@ -1108,6 +1069,7 @@ def insights_series_route():
         "timestamp": time.time(),
         "series": out
     })
+
 
 
 @app.route("/convert")
