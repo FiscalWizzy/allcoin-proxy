@@ -48,8 +48,8 @@ FIAT_REFRESH = 1800  # 30 min
 INSIGHTS_REFRESH = 1800 # 30 min
 
 # --- Sparkline series config (24h) ---
-INSIGHTS_SERIES_WINDOW_SEC = 24 * 3600
-INSIGHTS_SERIES_POINTS = int(INSIGHTS_SERIES_WINDOW_SEC / INSIGHTS_REFRESH)  # 48 if refresh=1800
+INSIGHTS_SERIES_WINDOW_SEC = 30 * 24 * 3600
+INSIGHTS_SERIES_POINTS = int(INSIGHTS_SERIES_WINDOW_SEC / INSIGHTS_REFRESH)  
 
 # -----------------------
 # Persistence paths
@@ -1042,6 +1042,19 @@ def insights_series_route():
     keys_param = (request.args.get("keys") or "").strip()
     points_req = request.args.get("points", type=int)
 
+    # --- time window & smoothing ---
+    days = request.args.get("days", type=int, default=30)
+    target = request.args.get("target", type=int, default=160)
+
+    # how many raw points exist for this window
+    points_raw = int((days * 24 * 3600) / INSIGHTS_REFRESH)
+    points_raw = min(points_raw, INSIGHTS_SERIES_POINTS)
+
+    # downsampling stride (keeps sparkline smooth)
+    stride = max(1, points_raw // target)
+
+
+
     # enforce sane bounds
     default_points = INSIGHTS_SERIES_POINTS
     points = default_points if points_req is None else max(4, min(points_req, default_points))
@@ -1061,7 +1074,10 @@ def insights_series_route():
             dq = insights_series.get(k)
             if not dq:
                 continue
-            out[k] = list(dq)[-points:]  # each point is [ts, val]
+
+            arr = list(dq)[-points_raw:]   # take last N raw points
+            arr = arr[::stride]            # downsample for smooth sparkline
+            out[k] = arr
 
     return jsonify({
         "points": points,
