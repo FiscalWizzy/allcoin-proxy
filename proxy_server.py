@@ -1052,66 +1052,23 @@ def insights_series_route():
     ensure_background_threads()
 
     keys_param = (request.args.get("keys") or "").strip()
-    points_req = request.args.get("points", type=int)
 
-    # --- time window & smoothing ---
+    # time window & smoothing
     days = request.args.get("days", type=int, default=30)
     target = request.args.get("target", type=int, default=160)
 
     # how many raw points exist for this window
     points_raw = int((days * 24 * 3600) / INSIGHTS_REFRESH)
-    points_raw = min(points_raw, INSIGHTS_SERIES_POINTS)
+    points_raw = max(4, min(points_raw, INSIGHTS_SERIES_POINTS))
 
     # downsampling stride (keeps sparkline smooth)
-    stride = max(1, points_raw // target)
+    stride = max(1, points_raw // max(10, target))
 
-
-
-    # enforce sane bounds
-    default_points = INSIGHTS_SERIES_POINTS
-    points = default_points if points_req is None else max(4, min(points_req, default_points))
-
+    # keys selection
     with _cache_lock:
         available_keys = list(insights_series.keys()) if insights_series else []
 
-    # If client provided keys, filter. Otherwise return all we have.
-    if keys_param:
-        keys = [k.strip() for k in keys_param.split(",") if k.strip()]
-    else:
-        keys = available_keys
-
-    out = {}
-    with _cache_lock:
-        for k in keys:
-            dq = insights_series.get(k)
-            if not dq:
-                continue
-
-            arr = list(dq)[-points_raw:]   # take last N raw points
-            arr = arr[::stride]            # downsample for smooth sparkline
-            out[k] = arr
-
-    return jsonify({
-        "points": points,
-        "refresh": INSIGHTS_REFRESH,
-        "timestamp": time.time(),
-        "series": out
-    })
-
-
-@app.route("/insights-series")
-def insights_series_route():
-    ensure_background_threads()
-
-    keys_param = (request.args.get("keys") or "").strip()
-    keys = [k for k in keys_param.split(",") if k] if keys_param else []
-
-    days = request.args.get("days", type=int, default=30)
-    target = request.args.get("target", type=int, default=160)
-
-    points_raw = int((days * 24 * 3600) / INSIGHTS_REFRESH)
-    points_raw = min(points_raw, INSIGHTS_SERIES_POINTS)
-    stride = max(1, points_raw // target)
+    keys = [k.strip() for k in keys_param.split(",") if k.strip()] if keys_param else available_keys
 
     out = {}
     with _cache_lock:
@@ -1120,10 +1077,17 @@ def insights_series_route():
             if not dq:
                 continue
             arr = list(dq)[-points_raw:]
-            arr = arr[::stride]
-            out[k] = arr
+            out[k] = arr[::stride]
 
-    return jsonify({"series": out, "timestamp": time.time()})
+    return jsonify({
+        "days": days,
+        "target": target,
+        "refresh": INSIGHTS_REFRESH,
+        "timestamp": time.time(),
+        "series": out
+    })
+
+
 
 
 
