@@ -50,7 +50,8 @@ INSIGHTS_REFRESH = 1800 # 30 min
 # --- Sparkline series config (24h) ---
 INSIGHTS_SERIES_WINDOW_SEC = 30 * 24 * 3600
 INSIGHTS_SERIES_POINTS = int(INSIGHTS_SERIES_WINDOW_SEC / INSIGHTS_REFRESH)  
-
+insights_series = {}  # key -> deque([[ts, val], ...])
+INSIGHTS_SERIES_POINTS = 2000  # enough for ~30 days at 30min (1440)
 # -----------------------
 # Persistence paths
 # -----------------------
@@ -232,29 +233,33 @@ insights_snapshot: Dict = {}
 
 def _save_cache():
     """Persist in-memory caches to disk (compact and memory-safe)."""
-    with _cache_lock:
-        try:
-            # Save only fiat board and insights (chart caching removed)
-            with open(FIAT_FILE, "w") as f:
-                json.dump(fiat_board_snapshot, f, indent=None, separators=(',', ':'))
+    try:
+        with _cache_lock:
+            fiat_payload = fiat_board_snapshot
+            insights_payload = insights_snapshot
+            series_payload = {
+                "points": INSIGHTS_SERIES_POINTS,
+            "refresh": INSIGHTS_REFRESH,
+            "saved_at": time.time(),
+            "series": {k: list(dq) for k, dq in insights_series.items() if dq}
+        }
 
-            with open(INSIGHTS_FILE, "w") as f:
-                json.dump(t, f, indent=None, separators=(',', ':'))
 
-                        # Save insights series
-            with _cache_lock:
-                series_payload = {
-                    "points": INSIGHTS_SERIES_POINTS,
-                    "refresh": INSIGHTS_REFRESH,
-                    "saved_at": time.time(),
-                    "series": {k: list(dq) for k, dq in insights_series.items() if dq}
-                }
-            with open(SERIES_FILE, "w") as f:
-                json.dump(series_payload, f, indent=None, separators=(',', ':'))
+        # write outside lock (keeps lock hold time small)
+        with open(FIAT_FILE, "w") as f:
+            json.dump(fiat_payload, f, separators=(",", ":"))
 
-            _log("INFO", "💾 Cache saved successfully (compact mode, no chart cache).")
-        except Exception as e:
-            _log("INFO", f"⚠️ Cache save failed: {e}")
+        with open(INSIGHTS_FILE, "w") as f:
+            json.dump(insights_payload, f, separators=(",", ":"))
+
+        with open(SERIES_FILE, "w") as f:
+            json.dump(series_payload, f, separators=(",", ":"))
+
+        _log("INFO", f"💾 series keys being saved: {len(series_payload['series'])}")
+
+    except Exception as e:
+        _log("INFO", f"⚠️ Cache save failed: {e}")
+
 
 
 def _load_cache():
@@ -766,11 +771,18 @@ def _insights_loop():
                 "timestamp": time.time(),
             }
 
-            ts = snap.get("timestamp", time.time())
+            ts = snap["timestamp"]
             for k, v in snap.items():
                 if k == "timestamp":
                     continue
-                _append_series_point(k, ts, v)
+                if v is None:
+                    continue
+                dq = insights_series.get(k)
+                if dq is None:
+                    dq = deque(maxlen=INSIGHTS_SERIES_POINTS)
+                    insights_series[k] = dq
+                dq.append([ts, float(v)])
+
 
             with _cache_lock:
                 insights_snapshot = snap
@@ -1085,6 +1097,33 @@ def insights_series_route():
         "timestamp": time.time(),
         "series": out
     })
+
+
+@app.route("/insights-series")
+def insights_series_route():
+    ensure_background_threads()
+
+    keys_param = (request.args.get("keys") or "").strip()
+    keys = [k for k in keys_param.split(",") if k] if keys_param else []
+
+    days = request.args.get("days", type=int, default=30)
+    target = request.args.get("target", type=int, default=160)
+
+    points_raw = int((days * 24 * 3600) / INSIGHTS_REFRESH)
+    points_raw = min(points_raw, INSIGHTS_SERIES_POINTS)
+    stride = max(1, points_raw // target)
+
+    out = {}
+    with _cache_lock:
+        for k in keys:
+            dq = insights_series.get(k)
+            if not dq:
+                continue
+            arr = list(dq)[-points_raw:]
+            arr = arr[::stride]
+            out[k] = arr
+
+    return jsonify({"series": out, "timestamp": time.time()})
 
 
 
