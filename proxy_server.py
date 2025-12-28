@@ -1061,8 +1061,6 @@ def insights_series_route():
     points_raw = int((days * 24 * 3600) / INSIGHTS_REFRESH)
     points_raw = max(4, min(points_raw, INSIGHTS_SERIES_POINTS))
 
-    # downsampling stride (keeps sparkline smooth)
-    stride = max(1, points_raw // max(10, target))
 
     # keys selection
     with _cache_lock:
@@ -1076,16 +1074,17 @@ def insights_series_route():
             dq = insights_series.get(k)
             if not dq:
                 continue
-            arr = list(dq)[-points_raw:]
-            out[k] = arr[::stride]
+        arr = list(dq)
+        if len(arr) > points_raw:
+            arr = arr[-points_raw:]
 
-    return jsonify({
-        "days": days,
-        "target": target,
-        "refresh": INSIGHTS_REFRESH,
-        "timestamp": time.time(),
-        "series": out
-    })
+        # ✅ stride based on REAL available points
+        stride = max(1, len(arr) // target)
+
+        out[k] = arr[::stride]
+        _log("INFO", f"series {k}: raw={len(dq)} window={len(arr)} stride={stride} out={len(out[k])}")
+    return jsonify({"series": out, "timestamp": time.time()})
+
 
 
 
